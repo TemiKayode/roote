@@ -142,6 +142,8 @@ func TestListMessagesValidatesFilters(t *testing.T) {
 			t.Errorf("GET %s status = %d, want %d: %s", target, response.Code, want, response.Body)
 		}
 	}
+	// Map iteration order is random, so check the filter on a request of its own.
+	serve(router, http.MethodGet, "/v1/messages?status=failed&recipient=%2B14155552671", "")
 	if reads.filter.Status != "failed" || reads.filter.Recipient != "+14155552671" {
 		t.Fatalf("filter passed to store = %+v", reads.filter)
 	}
