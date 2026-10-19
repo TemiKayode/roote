@@ -100,11 +100,12 @@ func (f *fakeSMSStore) ProcessSMSWebhookEvent(_ context.Context, event store.SMS
 	return true, nil
 }
 
-func (f *fakeStore) AcceptNotification(
+func (f *fakeStore) AcceptAuditedNotification(
 	_ context.Context,
 	_, _ string,
 	_ store.Notification,
 	request []byte,
+	_ *store.AuditEvent,
 ) (uuid.UUID, bool, error) {
 	f.calls++
 	hash := sha256.Sum256(request)
@@ -127,7 +128,7 @@ func (f *fakeStore) Ping(context.Context) error {
 func TestCreateNotificationIdempotency(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	repository := &fakeStore{}
-	router := New(slog.New(slog.NewTextHandler(io.Discard, nil)), "account", repository)
+	router := New(slog.New(slog.NewTextHandler(io.Discard, nil)), "00000000-0000-4000-8000-000000000001", repository)
 	body := `{"event":"welcome","channels":["email"],"recipient":{"email":"person@example.com"},"content":{"subject":"Welcome","body":"Hello"}}`
 
 	first := postNotification(router, "key-1", body)
@@ -172,7 +173,7 @@ func TestCreateNotificationIdempotency(t *testing.T) {
 func TestCreateNotificationRejectsInvalidRecipient(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	repository := &fakeStore{}
-	router := New(slog.New(slog.NewTextHandler(io.Discard, nil)), "account", repository)
+	router := New(slog.New(slog.NewTextHandler(io.Discard, nil)), "00000000-0000-4000-8000-000000000001", repository)
 	body := `{"event":"welcome","channels":["sms"],"recipient":{"phone":"5551234567"},"content":{"body":"Hello"}}`
 	response := postNotification(router, "key-2", body)
 	if response.Code != http.StatusBadRequest {
@@ -378,7 +379,7 @@ func signTwilioTest(token, requestURL string, values url.Values) string {
 func TestCreateNotificationRejectsUnknownFields(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	repository := &fakeStore{}
-	router := New(slog.New(slog.NewTextHandler(io.Discard, nil)), "account", repository)
+	router := New(slog.New(slog.NewTextHandler(io.Discard, nil)), "00000000-0000-4000-8000-000000000001", repository)
 	body := `{"event":"welcome","channels":["email"],"unexpected":"value","recipient":{"email":"person@example.com"},"content":{"subject":"Welcome","body":"Hello"}}`
 	response := postNotification(router, "key-3", body)
 	if response.Code != http.StatusBadRequest {
@@ -471,7 +472,7 @@ func TestDomainRegistrationReturnsDNSRecordsAndQueuesVerification(t *testing.T) 
 	queued := false
 	router := NewWithEmail(
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
-		"account",
+		"00000000-0000-4000-8000-000000000001",
 		repository,
 		EmailFeatures{
 			DomainStore:   domains,
@@ -521,7 +522,7 @@ func TestSendGridWebhookOnlyProcessesSignedHardEvents(t *testing.T) {
 	domains := &fakeDomainStore{}
 	router := NewWithEmail(
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
-		"account",
+		"00000000-0000-4000-8000-000000000001",
 		&fakeStore{},
 		EmailFeatures{DomainStore: domains, WebhookVerifier: acceptingWebhookVerifier{}},
 	)

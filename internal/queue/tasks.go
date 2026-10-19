@@ -19,6 +19,58 @@ const TaskDomainVerification = "domain:verify"
 const TaskSMSStopConfirmation = "sms:stop-confirm"
 const TaskWebhookDelivery = "webhook:deliver"
 
+// Work is split into queues per class so a marketing send or a burst of webhook retries
+// cannot delay transactional messages. Each queue name is the configured base plus a suffix.
+const (
+	ClassTransactional = "transactional"
+	ClassMarketing     = "marketing"
+	ClassWebhooks      = "webhooks"
+	ClassSystem        = "system"
+)
+
+// queueWeights are Asynq's weighted-priority shares: a worker picks transactional work
+// six times as often as system work, but no queue is starved.
+var queueWeights = []struct {
+	class  string
+	weight int
+}{
+	{ClassTransactional, 6},
+	{ClassWebhooks, 2},
+	{ClassMarketing, 2},
+	{ClassSystem, 1},
+}
+
+// QueueName returns the Asynq queue for a work class.
+func QueueName(base, class string) string {
+	return base + "-" + class
+}
+
+// Queues returns the worker's queue weights. The bare base queue is included so tasks
+// enqueued before queues were split still drain.
+func Queues(base string) map[string]int {
+	queues := map[string]int{base: 1}
+	for _, queue := range queueWeights {
+		queues[QueueName(base, queue.class)] = queue.weight
+	}
+	return queues
+}
+
+// QueueNames lists every queue the worker consumes, most important first.
+func QueueNames(base string) []string {
+	names := make([]string, 0, len(queueWeights)+1)
+	for _, queue := range queueWeights {
+		names = append(names, QueueName(base, queue.class))
+	}
+	return append(names, base)
+}
+
+func notificationQueue(base, trafficClass string) string {
+	if trafficClass == "marketing" {
+		return QueueName(base, ClassMarketing)
+	}
+	return QueueName(base, ClassTransactional)
+}
+
 type notificationPayload struct {
 	MessageID string `json:"message_id"`
 }
@@ -38,14 +90,20 @@ type webhookDeliveryPayload struct {
 	DeliveryID string `json:"delivery_id"`
 }
 
-func EnqueueNotification(ctx context.Context, client *asynq.Client, queueName string, messageID uuid.UUID) error {
+func EnqueueNotification(
+	ctx context.Context,
+	client *asynq.Client,
+	baseQueue string,
+	messageID uuid.UUID,
+	trafficClass string,
+) error {
 	payload, err := json.Marshal(notificationPayload{MessageID: messageID.String()})
 	if err != nil {
 		return fmt.Errorf("marshal notification task: %w", err)
 	}
 	task := asynq.NewTask(TaskNotificationDelivery, payload)
 	_, err = client.EnqueueContext(ctx, task,
-		asynq.Queue(queueName),
+		asynq.Queue(notificationQueue(baseQueue, trafficClass)),
 		asynq.TaskID(messageID.String()),
 		asynq.Unique(24*time.Hour),
 	)
@@ -58,7 +116,7 @@ func EnqueueNotification(ctx context.Context, client *asynq.Client, queueName st
 func EnqueueDomainVerification(
 	ctx context.Context,
 	client *asynq.Client,
-	queueName, accountID string,
+	baseQueue, accountID string,
 	domainID uuid.UUID,
 ) error {
 	payload, err := json.Marshal(domainVerificationPayload{AccountID: accountID, DomainID: domainID.String()})
@@ -66,7 +124,7 @@ func EnqueueDomainVerification(
 		return fmt.Errorf("marshal domain verification task: %w", err)
 	}
 	_, err = client.EnqueueContext(ctx, asynq.NewTask(TaskDomainVerification, payload),
-		asynq.Queue(queueName),
+		asynq.Queue(QueueName(baseQueue, ClassSystem)),
 		asynq.TaskID("verify-"+domainID.String()),
 		asynq.Unique(5*time.Minute),
 	)
@@ -79,7 +137,7 @@ func EnqueueDomainVerification(
 func EnqueueSMSStopConfirmation(
 	ctx context.Context,
 	client *asynq.Client,
-	queueName, provider, phone, eventID string,
+	baseQueue, provider, phone, eventID string,
 ) error {
 	payload, err := json.Marshal(smsStopConfirmationPayload{
 		Provider: provider,
@@ -91,7 +149,7 @@ func EnqueueSMSStopConfirmation(
 	}
 	taskIDHash := sha256.Sum256([]byte(provider + ":" + eventID))
 	_, err = client.EnqueueContext(ctx, asynq.NewTask(TaskSMSStopConfirmation, payload),
-		asynq.Queue(queueName),
+		asynq.Queue(QueueName(baseQueue, ClassTransactional)),
 		asynq.TaskID("sms-stop-"+hex.EncodeToString(taskIDHash[:])),
 		asynq.Unique(24*time.Hour),
 	)
@@ -104,7 +162,7 @@ func EnqueueSMSStopConfirmation(
 func EnqueueWebhookDelivery(
 	ctx context.Context,
 	client *asynq.Client,
-	queueName string,
+	baseQueue string,
 	deliveryID uuid.UUID,
 ) error {
 	payload, err := json.Marshal(webhookDeliveryPayload{DeliveryID: deliveryID.String()})
@@ -112,7 +170,7 @@ func EnqueueWebhookDelivery(
 		return fmt.Errorf("marshal webhook delivery task: %w", err)
 	}
 	_, err = client.EnqueueContext(ctx, asynq.NewTask(TaskWebhookDelivery, payload),
-		asynq.Queue(queueName),
+		asynq.Queue(QueueName(baseQueue, ClassWebhooks)),
 		asynq.TaskID("webhook-"+deliveryID.String()),
 		asynq.MaxRetry(8),
 		asynq.Unique(24*time.Hour),

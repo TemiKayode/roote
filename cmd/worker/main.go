@@ -66,7 +66,7 @@ func run() error {
 	defer redisClient.Close()
 	metrics := observability.NewMetrics()
 	server := asynq.NewServer(redis, asynq.Config{
-		Queues:          map[string]int{cfg.AsynqQueue: 1},
+		Queues:          queue.Queues(cfg.AsynqQueue),
 		Concurrency:     cfg.WorkerConcurrency,
 		ShutdownTimeout: time.Duration(cfg.ShutdownTimeoutSeconds) * time.Second,
 		Logger:          slogAsynqLogger{logger: logger},
@@ -82,7 +82,9 @@ func run() error {
 		},
 		func(ctx context.Context, accountID string, domainID uuid.UUID) error {
 			return observeTask(metrics, queue.TaskDomainVerification, func() error {
-				return processor.VerifyDomain(ctx, accountID, domainID)
+				retries, _ := asynq.GetRetryCount(ctx)
+				maximumRetries, _ := asynq.GetMaxRetry(ctx)
+				return processor.VerifyDomain(ctx, accountID, domainID, retries, maximumRetries)
 			})
 		},
 		func(ctx context.Context, provider, phone, eventID string) error {
@@ -100,8 +102,8 @@ func run() error {
 	)); err != nil {
 		return fmt.Errorf("start Asynq server: %w", err)
 	}
-	go database.RunOutboxRelay(ctx, func(ctx context.Context, messageID uuid.UUID) error {
-		return queue.EnqueueNotification(ctx, client, cfg.AsynqQueue, messageID)
+	go database.RunOutboxRelay(ctx, func(ctx context.Context, messageID uuid.UUID, trafficClass string) error {
+		return queue.EnqueueNotification(ctx, client, cfg.AsynqQueue, messageID, trafficClass)
 	}, logger)
 	go database.RunWebhookRelay(ctx, func(ctx context.Context, deliveryID uuid.UUID) error {
 		return queue.EnqueueWebhookDelivery(ctx, client, cfg.AsynqQueue, deliveryID)
@@ -207,8 +209,11 @@ func runRetention(
 				logger.InfoContext(ctx, "expired messages purged", "count", deleted)
 			}
 			if deleted < 1000 {
-				return
+				break
 			}
+		}
+		if _, err := database.PurgeExpiredRateWindows(ctx); err != nil && ctx.Err() == nil {
+			logger.ErrorContext(ctx, "SMS rate window purge failed", "error", err)
 		}
 	}
 	run()

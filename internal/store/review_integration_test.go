@@ -149,7 +149,7 @@ func TestWebhookRelayDoesNotSpinOnStaleDelivery(t *testing.T) {
 		t.Fatal(err)
 	}
 	var staleID uuid.UUID
-	if _, err := repository.RelayOneWebhook(ctx, func(_ context.Context, id uuid.UUID) error {
+	if _, err := repository.RelayWebhookBatch(ctx, func(_ context.Context, id uuid.UUID) error {
 		staleID = id
 		return nil
 	}); err != nil {
@@ -167,7 +167,7 @@ func TestWebhookRelayDoesNotSpinOnStaleDelivery(t *testing.T) {
 	}
 	relayed := map[uuid.UUID]int{}
 	for range 3 {
-		if _, err := repository.RelayOneWebhook(ctx, func(_ context.Context, id uuid.UUID) error {
+		if _, err := repository.RelayWebhookBatch(ctx, func(_ context.Context, id uuid.UUID) error {
 			relayed[id]++
 			return nil
 		}); err != nil {

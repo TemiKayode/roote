@@ -51,7 +51,7 @@ type fakeRepository struct {
 func (f *fakeRepository) GetDomain(context.Context, string, uuid.UUID) (store.Domain, error) {
 	return store.Domain{}, errors.New("not implemented")
 }
-func (f *fakeRepository) SetDomainVerificationResult(context.Context, uuid.UUID, bool, string) error {
+func (f *fakeRepository) SetDomainVerificationResult(context.Context, uuid.UUID, bool, bool, string) error {
 	return errors.New("not implemented")
 }
 func (f *fakeRepository) GetEmailJob(context.Context, uuid.UUID) (store.EmailJob, error) {

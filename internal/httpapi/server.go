@@ -41,12 +41,13 @@ var (
 )
 
 type NotificationStore interface {
-	AcceptNotification(
+	AcceptAuditedNotification(
 		context.Context,
 		string,
 		string,
 		store.Notification,
 		[]byte,
+		*store.AuditEvent,
 	) (uuid.UUID, bool, error)
 	Ping(context.Context) error
 }
@@ -94,7 +95,7 @@ type RuntimeFeatures struct {
 	ReadyCheck func(context.Context) error
 	Metrics    *observability.Metrics
 	Inspector  *asynq.Inspector
-	QueueName  string
+	QueueNames []string
 }
 
 type EmailFeatures struct {
@@ -145,7 +146,7 @@ type Server struct {
 	readyCheck                 func(context.Context) error
 	metrics                    *observability.Metrics
 	inspector                  *asynq.Inspector
-	queueName                  string
+	queueNames                 []string
 }
 
 func New(logger *slog.Logger, accountID string, notificationStore NotificationStore) *gin.Engine {
@@ -231,7 +232,7 @@ func newRouter(
 		readyCheck:                 runtime.ReadyCheck,
 		metrics:                    runtime.Metrics,
 		inspector:                  runtime.Inspector,
-		queueName:                  runtime.QueueName,
+		queueNames:                 runtime.QueueNames,
 	}
 	router := gin.New()
 	router.Use(observability.Middleware(runtime.Metrics, logger))
@@ -416,32 +417,51 @@ func (s *Server) operationalSummary(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not load operational summary"})
 		return
 	}
-	if s.inspector == nil || s.queueName == "" {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "queue inspection is unavailable"})
+	queues, ok := s.existingQueues(c)
+	if !ok {
 		return
 	}
-	queueInfo, err := s.inspector.GetQueueInfo(s.queueName)
-	if err != nil {
-		s.logger.ErrorContext(c.Request.Context(), "could not inspect notification queue", "error", err)
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "could not inspect notification queue"})
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{
-		"database": summary,
-		"queue": gin.H{
+	queueSummaries := make([]gin.H, 0, len(queues))
+	for _, queueName := range queues {
+		queueInfo, err := s.inspector.GetQueueInfo(queueName)
+		if err != nil {
+			s.logger.ErrorContext(c.Request.Context(), "could not inspect queue", "queue", queueName, "error", err)
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "could not inspect notification queues"})
+			return
+		}
+		queueSummaries = append(queueSummaries, gin.H{
 			"name": queueInfo.Queue, "pending": queueInfo.Pending, "active": queueInfo.Active,
 			"scheduled": queueInfo.Scheduled, "retry": queueInfo.Retry, "archived": queueInfo.Archived,
 			"size": queueInfo.Size, "latency_seconds": queueInfo.Latency.Seconds(),
 			"paused": queueInfo.Paused, "failed_today": queueInfo.Failed,
-		},
-	})
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"database": summary, "queues": queueSummaries})
+}
+
+// existingQueues returns the configured queues that exist in Redis. Asynq creates a queue
+// on its first task, so a queue that never received work is not inspectable yet.
+func (s *Server) existingQueues(c *gin.Context) ([]string, bool) {
+	if s.inspector == nil || len(s.queueNames) == 0 {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "queue inspection is unavailable"})
+		return nil, false
+	}
+	present, err := s.inspector.Queues()
+	if err != nil {
+		s.logger.ErrorContext(c.Request.Context(), "could not list queues", "error", err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "could not inspect notification queues"})
+		return nil, false
+	}
+	queues := make([]string, 0, len(s.queueNames))
+	for _, queueName := range s.queueNames {
+		if slices.Contains(present, queueName) {
+			queues = append(queues, queueName)
+		}
+	}
+	return queues, true
 }
 
 func (s *Server) listDeadLetters(c *gin.Context) {
-	if s.inspector == nil || s.queueName == "" {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "queue inspection is unavailable"})
-		return
-	}
 	limit := 50
 	if rawLimit := c.Query("limit"); rawLimit != "" {
 		parsedLimit, err := strconv.Atoi(rawLimit)
@@ -451,47 +471,66 @@ func (s *Server) listDeadLetters(c *gin.Context) {
 		}
 		limit = parsedLimit
 	}
-	tasks, err := s.inspector.ListArchivedTasks(s.queueName, asynq.PageSize(limit))
-	if err != nil {
-		s.logger.ErrorContext(c.Request.Context(), "could not list archived tasks", "error", err)
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "could not list archived tasks"})
+	queues, ok := s.existingQueues(c)
+	if !ok {
 		return
 	}
 	type archivedTask struct {
 		ID           string    `json:"id"`
+		Queue        string    `json:"queue"`
 		Type         string    `json:"type"`
 		Retried      int       `json:"retried"`
 		MaxRetry     int       `json:"max_retry"`
 		LastFailedAt time.Time `json:"last_failed_at"`
 	}
-	response := make([]archivedTask, 0, len(tasks))
-	for _, task := range tasks {
-		response = append(response, archivedTask{
-			ID: task.ID, Type: task.Type, Retried: task.Retried,
-			MaxRetry: task.MaxRetry, LastFailedAt: task.LastFailedAt,
-		})
+	response := make([]archivedTask, 0, limit)
+	for _, queueName := range queues {
+		if len(response) == limit {
+			break
+		}
+		tasks, err := s.inspector.ListArchivedTasks(queueName, asynq.PageSize(limit-len(response)))
+		if err != nil {
+			s.logger.ErrorContext(c.Request.Context(), "could not list archived tasks", "queue", queueName, "error", err)
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "could not list archived tasks"})
+			return
+		}
+		for _, task := range tasks {
+			response = append(response, archivedTask{
+				ID: task.ID, Queue: task.Queue, Type: task.Type, Retried: task.Retried,
+				MaxRetry: task.MaxRetry, LastFailedAt: task.LastFailedAt,
+			})
+		}
 	}
 	c.JSON(http.StatusOK, gin.H{"tasks": response})
 }
 
 func (s *Server) retryDeadLetter(c *gin.Context) {
-	if s.inspector == nil || s.queueName == "" {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "queue inspection is unavailable"})
-		return
-	}
 	taskID := strings.TrimSpace(c.Param("id"))
 	if taskID == "" || len(taskID) > 128 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "task ID must be between 1 and 128 characters"})
 		return
 	}
-	if err := s.inspector.RunTask(s.queueName, taskID); err != nil {
-		if errors.Is(err, asynq.ErrTaskNotFound) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "archived task not found"})
+	queues, ok := s.existingQueues(c)
+	if !ok {
+		return
+	}
+	retriedQueue := ""
+	for _, queueName := range queues {
+		err := s.inspector.RunTask(queueName, taskID)
+		if errors.Is(err, asynq.ErrTaskNotFound) || errors.Is(err, asynq.ErrQueueNotFound) {
+			continue
+		}
+		if err != nil {
+			s.logger.ErrorContext(c.Request.Context(), "could not retry archived task",
+				"task_id", taskID, "queue", queueName, "error", err)
+			c.JSON(http.StatusConflict, gin.H{"error": "task could not be retried; it may no longer be archived"})
 			return
 		}
-		s.logger.ErrorContext(c.Request.Context(), "could not retry archived task",
-			"task_id", taskID, "error", err)
-		c.JSON(http.StatusConflict, gin.H{"error": "task could not be retried; it may no longer be archived"})
+		retriedQueue = queueName
+		break
+	}
+	if retriedQueue == "" {
+		c.JSON(http.StatusNotFound, gin.H{"error": "archived task not found"})
 		return
 	}
 	accountID, err := uuid.Parse(s.accountIDFor(c))
@@ -504,7 +543,7 @@ func (s *Server) retryDeadLetter(c *gin.Context) {
 		if err := s.auditStore.RecordAuditEvent(c.Request.Context(), store.AuditEvent{
 			AccountID: accountID, APIKeyID: apiKeyID(c), Action: "queue.archived_task_retried",
 			Resource: "queue_task", ResourceID: taskID, RequestID: observability.RequestID(c),
-			Details: map[string]any{"queue": s.queueName},
+			Details: map[string]any{"queue": retriedQueue},
 		}); err != nil {
 			s.logger.ErrorContext(c.Request.Context(), "could not audit archived task retry",
 				"task_id", taskID, "error", err)
@@ -512,7 +551,7 @@ func (s *Server) retryDeadLetter(c *gin.Context) {
 			return
 		}
 	}
-	c.JSON(http.StatusAccepted, gin.H{"task_id": taskID, "status": "queued"})
+	c.JSON(http.StatusAccepted, gin.H{"task_id": taskID, "queue": retriedQueue, "status": "queued"})
 }
 
 func (s *Server) deleteMessage(c *gin.Context) {
@@ -597,8 +636,22 @@ func (s *Server) createNotification(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not process notification"})
 		return
 	}
-	messageID, duplicate, err := s.store.AcceptNotification(
-		c.Request.Context(), s.accountIDFor(c), idempotencyKey, notification, payload,
+	accountID, err := uuid.Parse(s.accountIDFor(c))
+	if err != nil {
+		s.logger.ErrorContext(c.Request.Context(), "authenticated account ID is invalid", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not accept notification"})
+		return
+	}
+	// The audit event is written in the same transaction as the message, so an accepted
+	// message is never left unaudited and a failed audit never reports an accepted message
+	// as a server error.
+	messageID, duplicate, err := s.store.AcceptAuditedNotification(
+		c.Request.Context(), accountID.String(), idempotencyKey, notification, payload,
+		&store.AuditEvent{
+			AccountID: accountID, APIKeyID: apiKeyID(c), Action: "notification.accepted",
+			Resource: "message", RequestID: observability.RequestID(c),
+			Details: map[string]any{"event": notification.Event, "channels": notification.Channels, "region": notification.Region},
+		},
 	)
 	switch {
 	case errors.Is(err, store.ErrIdempotencyConflict):
@@ -607,23 +660,6 @@ func (s *Server) createNotification(c *gin.Context) {
 		s.logger.ErrorContext(c.Request.Context(), "could not accept notification", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not accept notification"})
 	default:
-		if !duplicate && s.auditStore != nil {
-			accountID, parseErr := uuid.Parse(s.accountIDFor(c))
-			if parseErr != nil {
-				s.logger.ErrorContext(c.Request.Context(), "authenticated account ID is invalid", "error", parseErr)
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "could not audit notification acceptance"})
-				return
-			}
-			if auditErr := s.auditStore.RecordAuditEvent(c.Request.Context(), store.AuditEvent{
-				AccountID: accountID, APIKeyID: apiKeyID(c), Action: "notification.accepted",
-				Resource: "message", ResourceID: messageID.String(), RequestID: observability.RequestID(c),
-				Details: map[string]any{"event": notification.Event, "channels": notification.Channels, "region": notification.Region},
-			}); auditErr != nil {
-				s.logger.ErrorContext(c.Request.Context(), "could not audit notification acceptance", "error", auditErr)
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "could not audit notification acceptance"})
-				return
-			}
-		}
 		c.JSON(http.StatusAccepted, gin.H{
 			"message_id": messageID.String(),
 			"status":     "accepted",

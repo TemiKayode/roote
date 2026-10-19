@@ -25,6 +25,13 @@ var migrations embed.FS
 
 const migrationAdvisoryLock int64 = 824771004691823008
 
+const (
+	relayBatchSize       = 100
+	relayPollInterval    = 5 * time.Second
+	outboxNotifyChannel  = "roote_outbox"
+	webhookNotifyChannel = "roote_webhooks"
+)
+
 var (
 	ErrIdempotencyConflict = errors.New("idempotency key was already used with a different request")
 	ErrSMSRateLimit        = errors.New("SMS account rate limit exceeded")
@@ -539,6 +546,16 @@ func (s *Store) PurgeExpiredMessages(ctx context.Context, accountID uuid.UUID, r
 	return deleted, nil
 }
 
+// PurgeExpiredRateWindows deletes SMS rate-limit windows older than a day. Each window covers
+// one minute, so only the current one is ever read.
+func (s *Store) PurgeExpiredRateWindows(ctx context.Context) (int64, error) {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM sms_rate_limits WHERE window_start < now() - interval '1 day'`)
+	if err != nil {
+		return 0, fmt.Errorf("purge expired SMS rate windows: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 func (s *Store) CreateDomain(
 	ctx context.Context,
 	accountID, name, selector, publicKey, spfValue string,
@@ -600,7 +617,8 @@ func (s *Store) GetDomain(ctx context.Context, accountID string, domainID uuid.U
 func (s *Store) RequestDomainVerification(ctx context.Context, accountID string, domainID uuid.UUID) error {
 	result, err := s.pool.Exec(ctx, `
 			UPDATE domains
-			SET verification_status = 'pending', last_verification_error = NULL, last_verification_at = now()
+			SET verification_status = CASE WHEN verification_status = 'verified' THEN 'verified' ELSE 'pending' END,
+			    last_verification_error = NULL, last_verification_at = now()
 			WHERE account_id = $1 AND id = $2`, accountID, domainID)
 	if err != nil {
 		return fmt.Errorf("request domain verification: %w", err)
@@ -719,7 +737,7 @@ func (s *Store) CreateWebhookDeliveries(
 	if err != nil {
 		return fmt.Errorf("encode customer webhook payload: %w", err)
 	}
-	_, err = tx.Exec(ctx, `
+	tag, err := tx.Exec(ctx, `
 		INSERT INTO webhook_deliveries
 			(endpoint_id, event_type, payload, source_id, source_message_id)
 		SELECT id, $2, $3, $4, $1
@@ -731,6 +749,11 @@ func (s *Store) CreateWebhookDeliveries(
 	)
 	if err != nil {
 		return fmt.Errorf("queue customer webhook deliveries: %w", err)
+	}
+	if tag.RowsAffected() > 0 {
+		if _, err := tx.Exec(ctx, `SELECT pg_notify($1, '')`, webhookNotifyChannel); err != nil {
+			return fmt.Errorf("notify webhook relay: %w", err)
+		}
 	}
 	return nil
 }
@@ -795,72 +818,63 @@ func (s *Store) RecordWebhookAttempt(
 	return nil
 }
 
-func (s *Store) RelayOneWebhook(
+// RelayWebhookBatch enqueues up to relayBatchSize pending customer webhook deliveries and
+// returns how many were enqueued. queued_at is refreshed on every relay: a stale pending
+// delivery is usually still waiting in a long Asynq retry backoff, and without the refresh it
+// would be reselected on every loop and starve newer deliveries.
+func (s *Store) RelayWebhookBatch(
 	ctx context.Context,
 	enqueue func(context.Context, uuid.UUID) error,
-) (bool, error) {
+) (int, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return false, fmt.Errorf("begin webhook outbox transaction: %w", err)
+		return 0, fmt.Errorf("begin webhook outbox transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	var deliveryID uuid.UUID
-	err = tx.QueryRow(ctx, `
+	rows, err := tx.Query(ctx, `
 		SELECT id FROM webhook_deliveries
 		WHERE status = 'pending'
 		  AND (queued_at IS NULL OR queued_at < now() - interval '2 hours')
 		ORDER BY created_at
-		FOR UPDATE SKIP LOCKED LIMIT 1`).Scan(&deliveryID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		if rollbackErr := tx.Rollback(ctx); rollbackErr != nil {
-			return false, fmt.Errorf("release empty webhook transaction: %w", rollbackErr)
-		}
-		return false, nil
-	}
+		FOR UPDATE SKIP LOCKED LIMIT $1`, relayBatchSize)
 	if err != nil {
-		return false, fmt.Errorf("select pending webhook delivery: %w", err)
+		return 0, fmt.Errorf("select pending webhook deliveries: %w", err)
 	}
-	if err := enqueue(ctx, deliveryID); err != nil {
-		return false, fmt.Errorf("enqueue webhook delivery %s: %w", deliveryID, err)
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[uuid.UUID])
+	if err != nil {
+		return 0, fmt.Errorf("read pending webhook deliveries: %w", err)
 	}
-	// Refresh queued_at on every relay. A stale pending delivery is usually still waiting in a
-	// long Asynq retry backoff; without the refresh it would be reselected on every loop and
-	// starve newer deliveries.
-	if _, err := tx.Exec(ctx, `
-		UPDATE webhook_deliveries SET queued_at = now() WHERE id = $1`, deliveryID); err != nil {
-		return false, fmt.Errorf("mark webhook delivery enqueued: %w", err)
+	relayed := make([]uuid.UUID, 0, len(ids))
+	var enqueueErr error
+	for _, id := range ids {
+		if err := enqueue(ctx, id); err != nil {
+			enqueueErr = fmt.Errorf("enqueue webhook delivery %s: %w", id, err)
+			break
+		}
+		relayed = append(relayed, id)
+	}
+	if len(relayed) > 0 {
+		if _, err := tx.Exec(ctx, `
+			UPDATE webhook_deliveries SET queued_at = now() WHERE id = ANY($1)`, relayed); err != nil {
+			return 0, errors.Join(enqueueErr, fmt.Errorf("mark webhook deliveries enqueued: %w", err))
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return false, fmt.Errorf("commit webhook outbox transaction: %w", err)
+		return 0, errors.Join(enqueueErr, fmt.Errorf("commit webhook outbox transaction: %w", err))
 	}
-	return true, nil
+	return len(relayed), enqueueErr
 }
 
+// RunWebhookRelay relays customer webhook deliveries until ctx is cancelled.
 func (s *Store) RunWebhookRelay(
 	ctx context.Context,
 	enqueue func(context.Context, uuid.UUID) error,
 	logger *slog.Logger,
 ) {
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		published, err := s.RelayOneWebhook(ctx, enqueue)
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			logger.Error("webhook outbox relay failed", "error", err)
-			if !wait(ctx, time.Second) {
-				return
-			}
-			continue
-		}
-		if !published && !wait(ctx, 500*time.Millisecond) {
-			return
-		}
-	}
+	s.runRelay(ctx, webhookNotifyChannel, "webhook outbox relay", func(ctx context.Context) (int, error) {
+		return s.RelayWebhookBatch(ctx, enqueue)
+	}, logger)
 }
 
 func (s *Store) IsSMSSuppressed(ctx context.Context, accountID uuid.UUID, recipient string) (bool, error) {
@@ -1698,26 +1712,31 @@ func reconcileMessageStatus(ctx context.Context, tx pgx.Tx, messageID uuid.UUID)
 	return nil
 }
 
+// SetDomainVerificationResult records a DNS check. A failed check that will be retried keeps
+// the domain's current status, so re-checking a verified domain does not interrupt sending;
+// only a final failure (retries exhausted) marks the domain failed.
 func (s *Store) SetDomainVerificationResult(
 	ctx context.Context,
 	domainID uuid.UUID,
-	verified bool,
+	verified, final bool,
 	verificationError string,
 ) error {
-	status := "pending"
-	var verifiedAt any
-	if verified {
-		status = "verified"
-		verifiedAt = time.Now().UTC()
-	}
 	result, err := s.pool.Exec(ctx, `
 			UPDATE domains
-			SET verification_status = $2,
-			    last_verification_error = NULLIF($3, ''),
+			SET verification_status = CASE
+			        WHEN $2 THEN 'verified'
+			        WHEN $3 THEN 'failed'
+			        ELSE verification_status
+			    END,
+			    verified_at = CASE
+			        WHEN $2 THEN COALESCE(verified_at, now())
+			        WHEN $3 THEN NULL
+			        ELSE verified_at
+			    END,
+			    last_verification_error = NULLIF($4, ''),
 			    last_verification_at = now(),
-			    verified_at = $4,
 			    updated_at = now()
-			WHERE id = $1`, domainID, status, verificationError, verifiedAt)
+			WHERE id = $1`, domainID, verified, final, verificationError)
 	if err != nil {
 		return fmt.Errorf("save domain verification result: %w", err)
 	}
@@ -2034,6 +2053,19 @@ func (s *Store) AcceptNotification(
 	notification Notification,
 	request []byte,
 ) (uuid.UUID, bool, error) {
+	return s.AcceptAuditedNotification(ctx, accountID, idempotencyKey, notification, request, nil)
+}
+
+// AcceptAuditedNotification is AcceptNotification that also writes audit, when non-nil, in the
+// same transaction as a newly accepted message. The audit's ResourceID is set to the message ID.
+// Idempotent replays are not audited again.
+func (s *Store) AcceptAuditedNotification(
+	ctx context.Context,
+	accountID, idempotencyKey string,
+	notification Notification,
+	request []byte,
+	audit *AuditEvent,
+) (uuid.UUID, bool, error) {
 	requestHash := sha256.Sum256(request)
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
@@ -2085,81 +2117,155 @@ func (s *Store) AcceptNotification(
 		VALUES ($1, 'notification:deliver')`, messageID); err != nil {
 		return uuid.Nil, false, fmt.Errorf("insert notification outbox event: %w", err)
 	}
+	if audit != nil {
+		event := *audit
+		event.ResourceID = messageID.String()
+		if err := insertAuditEvent(ctx, tx, event); err != nil {
+			return uuid.Nil, false, err
+		}
+	}
+	// Delivered on commit; wakes the worker's relay without waiting for its poll.
+	if _, err := tx.Exec(ctx, `SELECT pg_notify($1, '')`, outboxNotifyChannel); err != nil {
+		return uuid.Nil, false, fmt.Errorf("notify outbox relay: %w", err)
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return uuid.Nil, false, fmt.Errorf("commit notification: %w", err)
 	}
 	return messageID, false, nil
 }
 
-func (s *Store) RelayOne(
+// RelayOutboxBatch enqueues up to relayBatchSize unpublished notification outbox rows, in
+// the order they were accepted, and returns how many were enqueued. Rows are marked published
+// only after their enqueue succeeds; on an enqueue error the rows already enqueued are still
+// marked and the error is returned.
+func (s *Store) RelayOutboxBatch(
 	ctx context.Context,
-	enqueue func(context.Context, uuid.UUID) error,
-) (bool, error) {
+	enqueue func(ctx context.Context, messageID uuid.UUID, trafficClass string) error,
+) (int, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return false, fmt.Errorf("begin outbox relay transaction: %w", err)
+		return 0, fmt.Errorf("begin outbox relay transaction: %w", err)
 	}
-	defer func() {
-		_ = tx.Rollback(ctx)
-	}()
+	defer func() { _ = tx.Rollback(ctx) }()
 
-	var messageID uuid.UUID
-	err = tx.QueryRow(ctx, `
-		SELECT message_id
-		FROM outbox
-		WHERE published_at IS NULL
-		ORDER BY created_at
-		FOR UPDATE SKIP LOCKED
-		LIMIT 1`).Scan(&messageID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		if rollbackErr := tx.Rollback(ctx); rollbackErr != nil {
-			return false, fmt.Errorf("release empty outbox transaction: %w", rollbackErr)
-		}
-		return false, nil
-	}
+	rows, err := tx.Query(ctx, `
+		SELECT o.message_id, COALESCE(m.payload->>'traffic_class', '')
+		FROM outbox o
+		JOIN messages m ON m.id = o.message_id
+		WHERE o.published_at IS NULL
+		ORDER BY o.created_at
+		FOR UPDATE OF o SKIP LOCKED
+		LIMIT $1`, relayBatchSize)
 	if err != nil {
-		return false, fmt.Errorf("select outbox row: %w", err)
+		return 0, fmt.Errorf("select outbox rows: %w", err)
 	}
-
-	if err := enqueue(ctx, messageID); err != nil {
-		return false, fmt.Errorf("enqueue message %s: %w", messageID, err)
+	type pending struct {
+		MessageID    uuid.UUID
+		TrafficClass string
 	}
-	if _, err := tx.Exec(ctx, `
-		UPDATE outbox
-		SET published_at = now()
-		WHERE message_id = $1 AND published_at IS NULL`, messageID); err != nil {
-		return false, fmt.Errorf("mark outbox row published: %w", err)
+	batch, err := pgx.CollectRows(rows, pgx.RowToStructByPos[pending])
+	if err != nil {
+		return 0, fmt.Errorf("read outbox rows: %w", err)
+	}
+	published := make([]uuid.UUID, 0, len(batch))
+	var enqueueErr error
+	for _, row := range batch {
+		if err := enqueue(ctx, row.MessageID, row.TrafficClass); err != nil {
+			enqueueErr = fmt.Errorf("enqueue message %s: %w", row.MessageID, err)
+			break
+		}
+		published = append(published, row.MessageID)
+	}
+	if len(published) > 0 {
+		if _, err := tx.Exec(ctx, `
+			UPDATE outbox SET published_at = now()
+			WHERE message_id = ANY($1) AND published_at IS NULL`, published); err != nil {
+			return 0, errors.Join(enqueueErr, fmt.Errorf("mark outbox rows published: %w", err))
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return false, fmt.Errorf("commit outbox relay: %w", err)
+		return 0, errors.Join(enqueueErr, fmt.Errorf("commit outbox relay: %w", err))
 	}
-	return true, nil
+	return len(published), enqueueErr
 }
 
+// RunOutboxRelay relays accepted notifications to the queue until ctx is cancelled.
 func (s *Store) RunOutboxRelay(
 	ctx context.Context,
-	enqueue func(context.Context, uuid.UUID) error,
+	enqueue func(ctx context.Context, messageID uuid.UUID, trafficClass string) error,
 	logger *slog.Logger,
 ) {
-	for {
-		if ctx.Err() != nil {
-			return
+	s.runRelay(ctx, outboxNotifyChannel, "outbox relay", func(ctx context.Context) (int, error) {
+		return s.RelayOutboxBatch(ctx, enqueue)
+	}, logger)
+}
+
+// runRelay drains work in batches, then sleeps until a PostgreSQL NOTIFY on channel says new
+// work was committed, or until relayPollInterval passes. The poll covers missed notifications,
+// a lost listener connection, and stale webhook deliveries that need re-relaying.
+func (s *Store) runRelay(
+	ctx context.Context,
+	channel, name string,
+	relay func(context.Context) (int, error),
+	logger *slog.Logger,
+) {
+	var listener *pgxpool.Conn
+	defer func() {
+		if listener != nil {
+			listener.Release()
 		}
-		published, err := s.RelayOne(ctx, enqueue)
+	}()
+	for ctx.Err() == nil {
+		if listener == nil {
+			listener = s.listen(ctx, channel, name, logger)
+		}
+		relayed, err := relay(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
 			}
-			logger.Error("outbox relay failed", "error", err)
+			logger.Error(name+" failed", "error", err)
 			if !wait(ctx, time.Second) {
 				return
 			}
 			continue
 		}
-		if !published && !wait(ctx, 500*time.Millisecond) {
-			return
+		if relayed == relayBatchSize {
+			continue
+		}
+		if listener == nil {
+			if !wait(ctx, relayPollInterval) {
+				return
+			}
+			continue
+		}
+		waitCtx, cancel := context.WithTimeout(ctx, relayPollInterval)
+		err = listener.Conn().PgConn().WaitForNotification(waitCtx)
+		cancel()
+		if err != nil && !pgconn.Timeout(err) && ctx.Err() == nil {
+			logger.Warn(name+" lost its notification listener; polling until it reconnects", "error", err)
+			listener.Release()
+			listener = nil
 		}
 	}
+}
+
+func (s *Store) listen(ctx context.Context, channel, name string, logger *slog.Logger) *pgxpool.Conn {
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		if ctx.Err() == nil {
+			logger.Warn(name+" could not acquire a notification listener", "error", err)
+		}
+		return nil
+	}
+	if _, err := conn.Exec(ctx, "LISTEN "+pgx.Identifier{channel}.Sanitize()); err != nil {
+		if ctx.Err() == nil {
+			logger.Warn(name+" could not listen for notifications", "error", err)
+		}
+		conn.Release()
+		return nil
+	}
+	return conn
 }
 
 func wait(ctx context.Context, duration time.Duration) bool {

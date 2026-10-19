@@ -23,7 +23,7 @@ import (
 
 type Repository interface {
 	GetDomain(context.Context, string, uuid.UUID) (store.Domain, error)
-	SetDomainVerificationResult(context.Context, uuid.UUID, bool, string) error
+	SetDomainVerificationResult(context.Context, uuid.UUID, bool, bool, string) error
 	GetEmailJob(context.Context, uuid.UUID) (store.EmailJob, error)
 	GetDKIMKey(context.Context, uuid.UUID, string) (store.DKIMKey, error)
 	IsEmailSuppressed(context.Context, uuid.UUID, string) (bool, error)
@@ -70,7 +70,12 @@ func NewProcessor(
 	}
 }
 
-func (p *Processor) VerifyDomain(ctx context.Context, accountID string, domainID uuid.UUID) error {
+func (p *Processor) VerifyDomain(
+	ctx context.Context,
+	accountID string,
+	domainID uuid.UUID,
+	retries, maximumRetries int,
+) error {
 	domain, err := p.repository.GetDomain(ctx, accountID, domainID)
 	if err != nil {
 		return fmt.Errorf("load domain for DNS verification: %w", err)
@@ -79,12 +84,13 @@ func (p *Processor) VerifyDomain(ctx context.Context, accountID string, domainID
 		ctx, netTXTResolver{}, domain.Name, domain.Selector, domain.PublicKey, domain.SPFValue,
 	)
 	if err != nil {
-		if saveErr := p.repository.SetDomainVerificationResult(ctx, domain.ID, false, err.Error()); saveErr != nil {
+		final := retries >= maximumRetries
+		if saveErr := p.repository.SetDomainVerificationResult(ctx, domain.ID, false, final, err.Error()); saveErr != nil {
 			return errors.Join(err, saveErr)
 		}
 		return fmt.Errorf("DNS records for %s are not verified: %w", domain.Name, err)
 	}
-	if err := p.repository.SetDomainVerificationResult(ctx, domain.ID, true, ""); err != nil {
+	if err := p.repository.SetDomainVerificationResult(ctx, domain.ID, true, false, ""); err != nil {
 		return err
 	}
 	p.logger.InfoContext(ctx, "sending domain verified", "domain", domain.Name, "domain_id", domain.ID)

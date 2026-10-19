@@ -64,12 +64,12 @@ func TestOrchestrationAndCustomerWebhookStore(t *testing.T) {
 	}
 
 	var queuedID uuid.UUID
-	queued, err := repository.RelayOneWebhook(ctx, func(_ context.Context, id uuid.UUID) error {
+	queued, err := repository.RelayWebhookBatch(ctx, func(_ context.Context, id uuid.UUID) error {
 		queuedID = id
 		return nil
 	})
-	if err != nil || !queued || queuedID == uuid.Nil {
-		t.Fatalf("RelayOneWebhook() = %t, id=%s, error=%v", queued, queuedID, err)
+	if err != nil || queued != 1 || queuedID == uuid.Nil {
+		t.Fatalf("RelayWebhookBatch() = %d, id=%s, error=%v", queued, queuedID, err)
 	}
 	webhookDelivery, err := repository.GetWebhookDelivery(ctx, queuedID)
 	if err != nil {
