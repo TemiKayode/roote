@@ -82,6 +82,7 @@ type MessageFilter struct {
 	Until     *time.Time
 	Limit     int
 	Cursor    string
+	TestMode  bool
 }
 
 type MessagePage struct {
@@ -135,13 +136,14 @@ type ConsentRecord struct {
 }
 
 // GetMessage returns one message of the account with its deliveries, attempts, and events.
-func (s *Store) GetMessage(ctx context.Context, accountID, messageID uuid.UUID) (MessageDetail, error) {
+// Test-mode callers see only test messages and live callers only live ones.
+func (s *Store) GetMessage(ctx context.Context, accountID, messageID uuid.UUID, testMode bool) (MessageDetail, error) {
 	var detail MessageDetail
 	var payload []byte
 	err := s.pool.QueryRow(ctx, `
 		SELECT id, event_name, channels, status, COALESCE(payload->>'traffic_class', ''),
 		       COALESCE(region, ''), created_at, updated_at, payload
-		FROM messages WHERE account_id = $1 AND id = $2`, accountID, messageID,
+		FROM messages WHERE account_id = $1 AND id = $2 AND test_mode = $3`, accountID, messageID, testMode,
 	).Scan(&detail.ID, &detail.Event, &detail.Channels, &detail.Status, &detail.TrafficClass,
 		&detail.Region, &detail.CreatedAt, &detail.UpdatedAt, &payload)
 	if err != nil {
@@ -192,11 +194,11 @@ func (s *Store) GetMessage(ctx context.Context, accountID, messageID uuid.UUID) 
 
 // ListMessages returns the account's messages, newest first, filtered and paginated.
 func (s *Store) ListMessages(ctx context.Context, accountID uuid.UUID, filter MessageFilter) (MessagePage, error) {
-	query := queryBuilder{args: []any{accountID}}
+	query := queryBuilder{args: []any{accountID, filter.TestMode}}
 	query.sql.WriteString(`
 		SELECT id, event_name, channels, status, COALESCE(payload->>'traffic_class', ''),
 		       COALESCE(region, ''), created_at, updated_at
-		FROM messages WHERE account_id = $1`)
+		FROM messages WHERE account_id = $1 AND test_mode = $2`)
 	if filter.Status != "" {
 		query.where("status = %s", filter.Status)
 	}

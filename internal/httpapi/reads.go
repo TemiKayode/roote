@@ -22,7 +22,7 @@ import (
 // ReadStore serves the read and management endpoints for messages, webhooks, domains,
 // suppressions, and consents.
 type ReadStore interface {
-	GetMessage(context.Context, uuid.UUID, uuid.UUID) (store.MessageDetail, error)
+	GetMessage(context.Context, uuid.UUID, uuid.UUID, bool) (store.MessageDetail, error)
 	ListMessages(context.Context, uuid.UUID, store.MessageFilter) (store.MessagePage, error)
 	ListWebhookEndpoints(context.Context, uuid.UUID) ([]store.WebhookEndpointSummary, error)
 	DeactivateWebhookEndpoint(context.Context, uuid.UUID, uuid.UUID) error
@@ -62,7 +62,7 @@ func (s *Server) getMessage(c *gin.Context) {
 	if !ok {
 		return
 	}
-	detail, err := s.reads.GetMessage(c.Request.Context(), accountID, messageID)
+	detail, err := s.reads.GetMessage(c.Request.Context(), accountID, messageID, testMode(c))
 	if errors.Is(err, pgx.ErrNoRows) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
 		return
@@ -86,7 +86,7 @@ func (s *Server) listMessages(c *gin.Context) {
 	}
 	filter := store.MessageFilter{
 		Status: c.Query("status"), Recipient: strings.TrimSpace(c.Query("recipient")),
-		Limit: limit, Cursor: c.Query("cursor"),
+		Limit: limit, Cursor: c.Query("cursor"), TestMode: testMode(c),
 	}
 	if _, valid := messageStatuses[filter.Status]; filter.Status != "" && !valid {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "status must be a message status"})

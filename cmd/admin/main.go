@@ -69,6 +69,7 @@ func createKey(ctx context.Context, database *store.Store, accountID uuid.UUID, 
 	name := flags.String("name", "", "human-readable key name")
 	scopeList := flags.String("scopes", "notifications:write", "comma-separated API key scopes")
 	expiration := flags.Duration("expires-in", 0, "optional key lifetime (for example 720h)")
+	testMode := flags.Bool("test", false, "create a test-mode key whose messages never reach a provider")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -91,14 +92,22 @@ func createKey(ctx context.Context, database *store.Store, accountID uuid.UUID, 
 	if _, err := rand.Read(secret); err != nil {
 		return fmt.Errorf("generate API key: %w", err)
 	}
-	token := "rt_live_" + base64.RawURLEncoding.EncodeToString(secret)
+	prefix := "rt_live_"
+	if *testMode {
+		prefix = "rt_test_"
+	}
+	token := prefix + base64.RawURLEncoding.EncodeToString(secret)
 	hash := sha256.Sum256([]byte(token))
-	id, err := database.CreateAPIKey(ctx, accountID, strings.TrimSpace(*name), hash[:], scopes, expiresAt)
+	id, err := database.CreateAPIKey(ctx, accountID, strings.TrimSpace(*name), hash[:], scopes, expiresAt, *testMode)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("API key ID: %s\nAPI key (shown once): %s\nScopes: %s\n",
-		id, token, strings.Join(scopes, ","))
+	mode := "live"
+	if *testMode {
+		mode = "test"
+	}
+	fmt.Printf("API key ID: %s\nAPI key (shown once): %s\nScopes: %s\nMode: %s\n",
+		id, token, strings.Join(scopes, ","), mode)
 	return nil
 }
 

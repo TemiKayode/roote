@@ -28,7 +28,7 @@ type fakeReadStore struct {
 	messageNotFound bool
 }
 
-func (f *fakeReadStore) GetMessage(_ context.Context, _, id uuid.UUID) (store.MessageDetail, error) {
+func (f *fakeReadStore) GetMessage(_ context.Context, _, id uuid.UUID, _ bool) (store.MessageDetail, error) {
 	if f.messageNotFound || id != f.message.ID {
 		return store.MessageDetail{}, pgx.ErrNoRows
 	}

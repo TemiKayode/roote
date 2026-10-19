@@ -43,15 +43,7 @@ var (
 )
 
 type NotificationStore interface {
-	AcceptAuditedNotification(
-		context.Context,
-		string,
-		string,
-		store.Notification,
-		[]byte,
-		[]byte,
-		*store.AuditEvent,
-	) (uuid.UUID, bool, error)
+	Accept(context.Context, store.Acceptance) (uuid.UUID, bool, error)
 	Ping(context.Context) error
 }
 
@@ -330,7 +322,8 @@ func (s *Server) requireScope(scope string) gin.HandlerFunc {
 			return
 		}
 		token := strings.TrimSpace(strings.TrimPrefix(authorization, prefix))
-		if len(token) < 24 || len(token) > 256 || !strings.HasPrefix(token, "rt_live_") {
+		if len(token) < 24 || len(token) > 256 ||
+			(!strings.HasPrefix(token, "rt_live_") && !strings.HasPrefix(token, "rt_test_")) {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "a valid bearer API key is required"})
 			c.Abort()
 			return
@@ -354,8 +347,16 @@ func (s *Server) requireScope(scope string) gin.HandlerFunc {
 		}
 		c.Set("account_id", key.AccountID.String())
 		c.Set("api_key_id", key.ID)
+		c.Set("test_mode", key.TestMode)
 		c.Next()
 	}
+}
+
+// testMode reports whether the caller authenticated with a test-mode key.
+func testMode(c *gin.Context) bool {
+	value, _ := c.Get("test_mode")
+	enabled, _ := value.(bool)
+	return enabled
 }
 
 func (s *Server) accountIDFor(c *gin.Context) string {
@@ -704,14 +705,18 @@ func (s *Server) createNotification(c *gin.Context) {
 	// The audit event is written in the same transaction as the message, so an accepted
 	// message is never left unaudited and a failed audit never reports an accepted message
 	// as a server error.
-	messageID, duplicate, err := s.store.AcceptAuditedNotification(
-		c.Request.Context(), accountID.String(), idempotencyKey, notification, payload, requestHash[:],
-		&store.AuditEvent{
+	messageID, duplicate, err := s.store.Accept(c.Request.Context(), store.Acceptance{
+		AccountID: accountID.String(), IdempotencyKey: idempotencyKey, Notification: notification,
+		Payload: payload, RequestHash: requestHash[:], TestMode: testMode(c),
+		Audit: &store.AuditEvent{
 			AccountID: accountID, APIKeyID: apiKeyID(c), Action: "notification.accepted",
 			Resource: "message", RequestID: observability.RequestID(c),
-			Details: map[string]any{"event": notification.Event, "channels": notification.Channels, "region": notification.Region},
+			Details: map[string]any{
+				"event": notification.Event, "channels": notification.Channels,
+				"region": notification.Region, "test_mode": testMode(c),
+			},
 		},
-	)
+	})
 	switch {
 	case errors.Is(err, store.ErrIdempotencyConflict):
 		c.JSON(http.StatusConflict, gin.H{"error": "Idempotency-Key was already used with a different request"})
@@ -723,6 +728,7 @@ func (s *Server) createNotification(c *gin.Context) {
 			"message_id": messageID.String(),
 			"status":     "accepted",
 			"duplicate":  duplicate,
+			"test_mode":  testMode(c),
 		})
 	}
 }

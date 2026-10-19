@@ -28,11 +28,12 @@ import (
 )
 
 type fakeStore struct {
-	id      uuid.UUID
-	hash    [32]byte
-	created bool
-	calls   int
-	payload []byte
+	id       uuid.UUID
+	hash     [32]byte
+	created  bool
+	calls    int
+	payload  []byte
+	testMode bool
 }
 
 type fakeMilestoneFourStore struct {
@@ -101,15 +102,10 @@ func (f *fakeSMSStore) ProcessSMSWebhookEvent(_ context.Context, event store.SMS
 	return true, nil
 }
 
-func (f *fakeStore) AcceptAuditedNotification(
-	_ context.Context,
-	_, _ string,
-	_ store.Notification,
-	payload []byte,
-	requestHash []byte,
-	_ *store.AuditEvent,
-) (uuid.UUID, bool, error) {
+func (f *fakeStore) Accept(_ context.Context, acceptance store.Acceptance) (uuid.UUID, bool, error) {
+	payload, requestHash := acceptance.Payload, acceptance.RequestHash
 	f.calls++
+	f.testMode = acceptance.TestMode
 	f.payload = payload
 	hash := sha256.Sum256(payload)
 	if requestHash != nil {
@@ -602,4 +598,24 @@ func postNotification(router http.Handler, idempotencyKey, body string) *httptes
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, request)
 	return recorder
+}
+
+func TestTestModeKeyCreatesTestMessages(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	accountID := uuid.New()
+	notifications := &fakeStore{}
+	authenticator := &fakeAPIKeyStore{key: store.APIKey{
+		ID: uuid.New(), AccountID: accountID, Scopes: []string{"notifications:write"}, TestMode: true,
+	}}
+	router := NewWithRuntime(
+		slog.New(slog.NewTextHandler(io.Discard, nil)), accountID.String(), notifications,
+		EmailFeatures{}, SMSFeatures{}, CustomerWebhookFeatures{},
+		RuntimeFeatures{AuthMode: "api_key", APIKeys: authenticator},
+	)
+	body := `{"event":"welcome","channels":["email"],"recipient":{"email":"person@example.com"},"content":{"subject":"Welcome","body":"Hello"}}`
+	response := postNotificationWithToken(router, "test-1", body, "rt_test_"+strings.Repeat("c", 43))
+	if response.Code != http.StatusAccepted || !strings.Contains(response.Body.String(), `"test_mode":true`) ||
+		!notifications.testMode {
+		t.Fatalf("test-mode notification status = %d: %s", response.Code, response.Body)
+	}
 }

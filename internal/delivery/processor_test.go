@@ -46,6 +46,19 @@ type fakeRepository struct {
 	exhaustedRetries      int
 	loadErr               error
 	dkimErr               error
+	emailEvents           []store.EmailWebhookEvent
+	smsEvents             []store.SMSWebhookEvent
+	beginProviders        []string
+}
+
+func (f *fakeRepository) ProcessEmailWebhookEvent(_ context.Context, event store.EmailWebhookEvent) (bool, error) {
+	f.emailEvents = append(f.emailEvents, event)
+	return true, nil
+}
+
+func (f *fakeRepository) ProcessSMSWebhookEvent(_ context.Context, event store.SMSWebhookEvent) (bool, error) {
+	f.smsEvents = append(f.smsEvents, event)
+	return true, nil
 }
 
 func (f *fakeRepository) GetDomain(context.Context, string, uuid.UUID) (store.Domain, error) {
@@ -78,8 +91,9 @@ func (f *fakeRepository) IsNotificationPreferred(_ context.Context, _ uuid.UUID,
 	}
 	return f.preferred, nil
 }
-func (f *fakeRepository) BeginEmailDelivery(context.Context, store.EmailJob, string) (bool, error) {
+func (f *fakeRepository) BeginEmailDelivery(_ context.Context, _ store.EmailJob, provider string) (bool, error) {
 	f.beginCount++
+	f.beginProviders = append(f.beginProviders, provider)
 	return true, nil
 }
 func (f *fakeRepository) CompleteEmailDelivery(_ context.Context, _ uuid.UUID, providerID string) error {
@@ -661,5 +675,50 @@ func TestHandleNotificationTaskPersistsRetryExhaustion(t *testing.T) {
 	}
 	if repository.exhaustedRetries != 50 {
 		t.Fatalf("retry exhaustion record = %d, want 50", repository.exhaustedRetries)
+	}
+}
+
+func TestTestModeEmailIsSimulatedWithoutTransportOrDomain(t *testing.T) {
+	for recipient, want := range map[string]string{
+		"person@example.net": "delivered",
+		"person@bounce.test": "bounce",
+	} {
+		messageID := uuid.New()
+		repository := &fakeRepository{job: store.EmailJob{
+			ID: messageID, AccountID: uuid.New(), TestMode: true, Channels: []string{"email"},
+			Recipient: recipient, Subject: "Hi", Body: "Test",
+		}}
+		processor := NewProcessor(repository, nil, nil, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		if err := processor.DeliverNotification(context.Background(), messageID); err != nil {
+			t.Fatalf("%s: %v", recipient, err)
+		}
+		if len(repository.beginProviders) != 1 || repository.beginProviders[0] != "test" ||
+			repository.completeCount != 1 || repository.senderCapacityCount != 0 ||
+			len(repository.emailEvents) != 1 || repository.emailEvents[0].EventType != want {
+			t.Fatalf("%s: providers=%v complete=%d capacity=%d events=%+v", recipient,
+				repository.beginProviders, repository.completeCount, repository.senderCapacityCount, repository.emailEvents)
+		}
+	}
+}
+
+func TestTestModeSMSStillChecksConsentButSkipsBudgets(t *testing.T) {
+	messageID := uuid.New()
+	repository := &fakeRepository{smsJob: store.SMSJob{
+		ID: messageID, AccountID: uuid.New(), TestMode: true, Channels: []string{"sms"},
+		Recipient: "+14155552671", Body: "Code 1234",
+	}}
+	processor := NewProcessor(repository, nil, nil, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := processor.DeliverNotification(context.Background(), messageID); !errors.Is(err, asynq.SkipRetry) {
+		t.Fatalf("test SMS without consent error = %v, want SkipRetry", err)
+	}
+	repository.smsConsent = true
+	repository.channelFailures = nil
+	if err := processor.DeliverNotification(context.Background(), messageID); err != nil {
+		t.Fatal(err)
+	}
+	if repository.smsComplete != 1 || repository.smsReservedCost != 0 || repository.senderCapacityCount != 0 ||
+		len(repository.smsEvents) != 1 || repository.smsEvents[0].Provider != "test" {
+		t.Fatalf("simulated SMS: complete=%d cost=%v capacity=%d events=%+v",
+			repository.smsComplete, repository.smsReservedCost, repository.senderCapacityCount, repository.smsEvents)
 	}
 }

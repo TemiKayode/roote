@@ -19,7 +19,7 @@ func TestGetMessageReturnsTimelineForOwningAccountOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	detail, err := repository.GetMessage(ctx, accountID, messageID)
+	detail, err := repository.GetMessage(ctx, accountID, messageID, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,7 +37,7 @@ func TestGetMessageReturnsTimelineForOwningAccountOnly(t *testing.T) {
 	if len(detail.Events) < 2 || detail.Events[0].Type != "accepted" {
 		t.Fatalf("events = %+v", detail.Events)
 	}
-	if _, err := repository.GetMessage(ctx, uuid.New(), messageID); !errors.Is(err, pgx.ErrNoRows) {
+	if _, err := repository.GetMessage(ctx, uuid.New(), messageID, false); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("other account read error = %v, want pgx.ErrNoRows", err)
 	}
 }

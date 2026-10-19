@@ -111,6 +111,7 @@ type Domain struct {
 type EmailJob struct {
 	ID           uuid.UUID
 	AccountID    uuid.UUID
+	TestMode     bool
 	Region       string
 	Channels     []string
 	Recipient    string
@@ -124,6 +125,7 @@ type EmailJob struct {
 type SMSJob struct {
 	ID           uuid.UUID
 	AccountID    uuid.UUID
+	TestMode     bool
 	Region       string
 	Channels     []string
 	Recipient    string
@@ -157,6 +159,8 @@ type APIKey struct {
 	ID        uuid.UUID
 	AccountID uuid.UUID
 	Scopes    []string
+	// TestMode keys create test messages, which never reach a provider.
+	TestMode bool
 }
 
 type AuditEvent struct {
@@ -268,6 +272,7 @@ func (s *Store) CreateAPIKey(
 	hash []byte,
 	scopes []string,
 	expiresAt *time.Time,
+	testMode bool,
 ) (uuid.UUID, error) {
 	var id uuid.UUID
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
@@ -276,15 +281,15 @@ func (s *Store) CreateAPIKey(
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	if err := tx.QueryRow(ctx, `
-			INSERT INTO api_keys (account_id, key_hash, name, scopes, expires_at)
-			VALUES ($1, $2, $3, $4, $5)
-			RETURNING id`, accountID, hash, name, scopes, expiresAt,
+			INSERT INTO api_keys (account_id, key_hash, name, scopes, expires_at, mode)
+			VALUES ($1, $2, $3, $4, $5, CASE WHEN $6 THEN 'test' ELSE 'live' END)
+			RETURNING id`, accountID, hash, name, scopes, expiresAt, testMode,
 	).Scan(&id); err != nil {
 		return uuid.Nil, fmt.Errorf("create API key: %w", err)
 	}
 	if err := insertAuditEvent(ctx, tx, AuditEvent{
 		AccountID: accountID, Action: "api_key.created", Resource: "api_key",
-		ResourceID: id.String(), Details: map[string]any{"name": name, "scopes": scopes},
+		ResourceID: id.String(), Details: map[string]any{"name": name, "scopes": scopes, "test_mode": testMode},
 	}); err != nil {
 		return uuid.Nil, err
 	}
@@ -328,8 +333,8 @@ func (s *Store) AuthenticateAPIKey(ctx context.Context, hash []byte) (APIKey, er
 			SET last_used_at = now()
 			WHERE key_hash = $1 AND revoked_at IS NULL
 			  AND (expires_at IS NULL OR expires_at > now())
-			RETURNING id, account_id, scopes`, hash,
-	).Scan(&key.ID, &key.AccountID, &key.Scopes)
+			RETURNING id, account_id, scopes, mode = 'test'`, hash,
+	).Scan(&key.ID, &key.AccountID, &key.Scopes, &key.TestMode)
 	if err != nil {
 		return APIKey{}, fmt.Errorf("authenticate API key: %w", err)
 	}
@@ -660,9 +665,9 @@ func (s *Store) GetSMSJob(ctx context.Context, messageID uuid.UUID) (SMSJob, err
 	var job SMSJob
 	var payload []byte
 	err := s.pool.QueryRow(ctx, `
-		SELECT account_id, channels, payload
+		SELECT account_id, channels, payload, test_mode
 		FROM messages WHERE id = $1`, messageID,
-	).Scan(&job.AccountID, &job.Channels, &payload)
+	).Scan(&job.AccountID, &job.Channels, &payload, &job.TestMode)
 	if err != nil {
 		return SMSJob{}, fmt.Errorf("load message for SMS delivery: %w", err)
 	}
@@ -745,10 +750,15 @@ func (s *Store) CreateWebhookDeliveries(
 	messageID uuid.UUID,
 	eventType string,
 ) error {
+	var testMode bool
+	if err := tx.QueryRow(ctx, `SELECT test_mode FROM messages WHERE id = $1`, messageID).Scan(&testMode); err != nil {
+		return fmt.Errorf("load message mode for customer webhook: %w", err)
+	}
 	payload, err := json.Marshal(map[string]any{
 		"id":         uuid.NewString(),
 		"type":       eventType,
 		"created_at": time.Now().UTC(),
+		"test_mode":  testMode,
 		"data":       map[string]string{"message_id": messageID.String()},
 	})
 	if err != nil {
@@ -1768,10 +1778,10 @@ func (s *Store) GetEmailJob(ctx context.Context, messageID uuid.UUID) (EmailJob,
 	var payload []byte
 	var channels []string
 	err := s.pool.QueryRow(ctx, `
-			SELECT account_id, channels, payload
+			SELECT account_id, channels, payload, test_mode
 			FROM messages
 			WHERE id = $1`, messageID,
-	).Scan(&job.AccountID, &channels, &payload)
+	).Scan(&job.AccountID, &channels, &payload, &job.TestMode)
 	if err != nil {
 		return EmailJob{}, fmt.Errorf("load message for email delivery: %w", err)
 	}
@@ -2071,27 +2081,39 @@ func (s *Store) AcceptNotification(
 	notification Notification,
 	request []byte,
 ) (uuid.UUID, bool, error) {
-	return s.AcceptAuditedNotification(ctx, accountID, idempotencyKey, notification, request, nil, nil)
+	return s.Accept(ctx, Acceptance{
+		AccountID: accountID, IdempotencyKey: idempotencyKey, Notification: notification, Payload: request,
+	})
 }
 
-// AcceptAuditedNotification is AcceptNotification that also writes audit, when non-nil, in the
-// same transaction as a newly accepted message. The audit's ResourceID is set to the message ID.
-// Idempotent replays are not audited again. payload is the notification as stored (for a
-// template, already rendered); requestHash, when non-nil, identifies the request as the client
-// sent it, so a replay matches even if the template's published version changed since.
-func (s *Store) AcceptAuditedNotification(
-	ctx context.Context,
-	accountID, idempotencyKey string,
-	notification Notification,
-	payload []byte,
-	requestHash []byte,
-	audit *AuditEvent,
-) (uuid.UUID, bool, error) {
+// Acceptance is a validated notification ready to persist.
+type Acceptance struct {
+	AccountID      string
+	IdempotencyKey string
+	Notification   Notification
+	// Payload is the notification as stored (for a template, already rendered).
+	Payload []byte
+	// RequestHash identifies the request as the client sent it, so a replay matches even if
+	// the template's published version changed since. Nil hashes Payload.
+	RequestHash []byte
+	// TestMode messages are simulated by the worker and never reach a provider. Test and live
+	// messages have separate idempotency keys.
+	TestMode bool
+	// Audit, when non-nil, is written in the same transaction as a newly accepted message
+	// with ResourceID set to the message ID. Idempotent replays are not audited again.
+	Audit *AuditEvent
+}
+
+// Accept persists a notification with its outbox row and accepted event, or returns the
+// existing message for an idempotent replay.
+func (s *Store) Accept(ctx context.Context, acceptance Acceptance) (uuid.UUID, bool, error) {
+	accountID, idempotencyKey := acceptance.AccountID, acceptance.IdempotencyKey
+	notification, request, audit := acceptance.Notification, acceptance.Payload, acceptance.Audit
+	requestHash := acceptance.RequestHash
 	if requestHash == nil {
-		sum := sha256.Sum256(payload)
+		sum := sha256.Sum256(request)
 		requestHash = sum[:]
 	}
-	request := payload
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return uuid.Nil, false, fmt.Errorf("begin notification transaction: %w", err)
@@ -2103,11 +2125,11 @@ func (s *Store) AcceptAuditedNotification(
 	var messageID uuid.UUID
 	err = tx.QueryRow(ctx, `
 		INSERT INTO messages
-			(account_id, idempotency_key, event_name, channels, payload, request_hash, region)
-		VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, ''))
-		ON CONFLICT (account_id, idempotency_key) DO NOTHING
+			(account_id, idempotency_key, event_name, channels, payload, request_hash, region, test_mode)
+		VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, ''), $8)
+		ON CONFLICT (account_id, test_mode, idempotency_key) DO NOTHING
 		RETURNING id`, accountID, idempotencyKey, notification.Event, notification.Channels,
-		request, requestHash, notification.Region).Scan(&messageID)
+		request, requestHash, notification.Region, acceptance.TestMode).Scan(&messageID)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return uuid.Nil, false, fmt.Errorf("insert message: %w", err)
 	}
@@ -2117,7 +2139,9 @@ func (s *Store) AcceptAuditedNotification(
 		if err := tx.QueryRow(ctx, `
 			SELECT id, request_hash
 			FROM messages
-			WHERE account_id = $1 AND idempotency_key = $2`, accountID, idempotencyKey).Scan(&messageID, &existingHash); err != nil {
+			WHERE account_id = $1 AND test_mode = $2 AND idempotency_key = $3`,
+			accountID, acceptance.TestMode, idempotencyKey,
+		).Scan(&messageID, &existingHash); err != nil {
 			return uuid.Nil, false, fmt.Errorf("load idempotent message: %w", err)
 		}
 		if !equalBytes(existingHash, requestHash) {

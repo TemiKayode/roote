@@ -122,6 +122,8 @@ A notification sends `"template": {"key", "version"?, "locale"?, "data"}` instea
 
 Direct sends can also include `content.html` (up to 500 KB) for an HTML email part and `content.sms` (up to 1,600 bytes) to send different text over SMS than `content.body`. Email is sent as `multipart/alternative` with the plain-text part first; SMTP messages are DKIM-signed over the whole message. Migration 8 adds the template tables.
 
+**Test-mode keys (Phase 1 item 4).** `admin create-key --test` issues an `rt_test_` key. Notifications it sends are marked `test_mode` and are simulated by the worker: suppression, SMS consent, routing, and templates behave as they do live, but no provider is contacted and no sender capacity, SMS budget, or rate limit is used. A domain does not need to be verified. Test emails are accepted and then delivered, unless the recipient's domain is `bounce.test`, which simulates a hard bounce (and suppresses that address). Test SMS are accepted and then delivered. Customer webhooks fire as usual with `"test_mode": true` in the payload. Test and live messages have separate idempotency keys, and each kind of key sees only its own messages in the read APIs. The accept response includes `test_mode`. Migration 9 adds the key mode and message flag.
+
 ## Build steps
 
 1. Install Go 1.24+ and Docker Desktop with Compose.

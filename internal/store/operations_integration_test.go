@@ -32,7 +32,7 @@ func TestOperationsStoreLifecycle(t *testing.T) {
 
 	keyHash := sha256.Sum256([]byte("high-entropy-integration-key"))
 	keyID, err := repository.CreateAPIKey(
-		ctx, accountID, "integration key", keyHash[:], []string{"notifications:write"}, nil,
+		ctx, accountID, "integration key", keyHash[:], []string{"notifications:write"}, nil, false,
 	)
 	if err != nil {
 		t.Fatal(err)

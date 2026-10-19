@@ -48,6 +48,8 @@ type Repository interface {
 	ReserveSMSConfirmationBudget(context.Context, string, uuid.UUID, string, float64, float64, int) error
 	ReleaseSMSConfirmationBudget(context.Context, string) error
 	MarkMessageFailed(context.Context, uuid.UUID, string) error
+	ProcessEmailWebhookEvent(context.Context, store.EmailWebhookEvent) (bool, error)
+	ProcessSMSWebhookEvent(context.Context, store.SMSWebhookEvent) (bool, error)
 }
 
 type Processor struct {
@@ -274,15 +276,18 @@ func (p *Processor) deliverChannel(
 
 func (p *Processor) deliverEmail(ctx context.Context, job store.EmailJob) error {
 	messageID := job.ID
-	if p.transport == nil {
-		return p.failChannelPermanently(ctx, messageID, "email", "email transport is disabled; configure EMAIL_TRANSPORT")
-	}
 	suppressed, err := p.repository.IsEmailSuppressed(ctx, job.AccountID, job.Recipient)
 	if err != nil {
 		return fmt.Errorf("check recipient suppression: %w", err)
 	}
 	if suppressed {
 		return p.failChannelPermanently(ctx, messageID, "email", "recipient is suppressed for email")
+	}
+	if job.TestMode {
+		return p.simulateEmail(ctx, job)
+	}
+	if p.transport == nil {
+		return p.failChannelPermanently(ctx, messageID, "email", "email transport is disabled; configure EMAIL_TRANSPORT")
 	}
 	from, err := mail.ParseAddress(p.config.EmailFrom)
 	if err != nil {
@@ -380,7 +385,7 @@ func (p *Processor) DeliverSMS(ctx context.Context, messageID uuid.UUID) error {
 	if !contains(job.Channels, "sms") {
 		return p.failChannelPermanently(ctx, messageID, "sms", "notification does not request SMS")
 	}
-	if p.smsTransport == nil {
+	if p.smsTransport == nil && !job.TestMode {
 		return p.failChannelPermanently(ctx, messageID, "sms", "SMS transport is disabled; configure SMS_TRANSPORT")
 	}
 	countryNumber, err := phonenumbers.Parse(job.Recipient, "")
@@ -388,11 +393,6 @@ func (p *Processor) DeliverSMS(ctx context.Context, messageID uuid.UUID) error {
 		return p.failChannelPermanently(ctx, messageID, "sms", "recipient phone number is invalid")
 	}
 	countryCode := phonenumbers.GetRegionCodeForNumber(countryNumber)
-	rate, hasRate := p.config.SMSCountryRatesUSD[countryCode]
-	budget, hasBudget := p.config.SMSCountryMonthlyCapsUSD[countryCode]
-	if !hasRate || !hasBudget {
-		return p.failChannelPermanently(ctx, messageID, "sms", "SMS country pricing and monthly budget are not configured")
-	}
 	trafficClass := job.TrafficClass
 	if trafficClass == "" {
 		trafficClass = "transactional"
@@ -410,6 +410,14 @@ func (p *Processor) DeliverSMS(ctx context.Context, messageID uuid.UUID) error {
 	}
 	if suppressed {
 		return p.failChannelPermanently(ctx, messageID, "sms", "recipient is suppressed for SMS")
+	}
+	if job.TestMode {
+		return p.simulateSMS(ctx, job, countryCode)
+	}
+	rate, hasRate := p.config.SMSCountryRatesUSD[countryCode]
+	budget, hasBudget := p.config.SMSCountryMonthlyCapsUSD[countryCode]
+	if !hasRate || !hasBudget {
+		return p.failChannelPermanently(ctx, messageID, "sms", "SMS country pricing and monthly budget are not configured")
 	}
 	segments := sms.SegmentCount(job.Body)
 	estimatedCost := float64(segments) * rate
@@ -538,6 +546,59 @@ func (p *Processor) SendSMSStopConfirmation(
 			return fmt.Errorf("%w: send SMS opt-out confirmation: %v", asynq.SkipRetry, err)
 		}
 		return fmt.Errorf("send SMS opt-out confirmation: %w", err)
+	}
+	return nil
+}
+
+// testProvider names the simulated provider used for test-mode messages.
+const testProvider = "test"
+
+// simulateEmail records a test-mode email as accepted and then delivered, or bounced when the
+// recipient's domain is bounce.test, through the same state transitions a provider callback
+// would cause. No provider is contacted and no sender capacity is used.
+func (p *Processor) simulateEmail(ctx context.Context, job store.EmailJob) error {
+	shouldSend, err := p.repository.BeginEmailDelivery(ctx, job, testProvider)
+	if err != nil || !shouldSend {
+		return err
+	}
+	if err := p.repository.CompleteEmailDelivery(ctx, job.ID, "test-"+job.ID.String()); err != nil {
+		return fmt.Errorf("persist simulated email acceptance: %w", err)
+	}
+	eventType := "delivered"
+	if strings.HasSuffix(strings.ToLower(job.Recipient), "@bounce.test") {
+		eventType = "bounce"
+	}
+	if _, err := p.repository.ProcessEmailWebhookEvent(ctx, store.EmailWebhookEvent{
+		ProviderEventID: "test:" + job.ID.String() + ":" + eventType,
+		MessageID:       job.ID,
+		Recipient:       job.Recipient,
+		EventType:       eventType,
+	}); err != nil {
+		return fmt.Errorf("persist simulated email %s: %w", eventType, err)
+	}
+	return nil
+}
+
+// simulateSMS records a test-mode SMS as accepted and then delivered. No provider is
+// contacted and no budget, rate limit, or sender capacity is used.
+func (p *Processor) simulateSMS(ctx context.Context, job store.SMSJob, countryCode string) error {
+	shouldSend, err := p.repository.BeginSMSDelivery(ctx, job, testProvider, countryCode, 0)
+	if err != nil || !shouldSend {
+		return err
+	}
+	providerMessageID := "test-" + job.ID.String()
+	if err := p.repository.CompleteSMSDelivery(ctx, job.ID, providerMessageID); err != nil {
+		return fmt.Errorf("persist simulated SMS acceptance: %w", err)
+	}
+	if _, err := p.repository.ProcessSMSWebhookEvent(ctx, store.SMSWebhookEvent{
+		ProviderEventID:   "test:" + job.ID.String() + ":delivered",
+		ProviderMessageID: providerMessageID,
+		Provider:          testProvider,
+		MessageID:         job.ID,
+		Recipient:         job.Recipient,
+		EventType:         "delivered",
+	}); err != nil {
+		return fmt.Errorf("persist simulated SMS delivery: %w", err)
 	}
 	return nil
 }
