@@ -34,6 +34,7 @@ import (
 	securesecret "github.com/TemiKayode/roote/internal/secret"
 	"github.com/TemiKayode/roote/internal/smswebhook"
 	"github.com/TemiKayode/roote/internal/store"
+	"github.com/TemiKayode/roote/internal/transport/sms"
 	"github.com/TemiKayode/roote/internal/webhook"
 )
 
@@ -1168,7 +1169,7 @@ func (s *Server) processTwilioSMSStatus(c *gin.Context, values url.Values) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Twilio status callback requires a valid To number"})
 		return
 	}
-	eventType, ok := normalizeTwilioStatus(values.Get("MessageStatus"))
+	eventType, ok := sms.NormalizeTwilioStatus(values.Get("MessageStatus"))
 	if !ok {
 		c.JSON(http.StatusOK, gin.H{"processed": 0})
 		return
@@ -1281,7 +1282,7 @@ func (s *Server) processTelnyxSMSStatus(c *gin.Context, eventID, eventType strin
 	if eventType == "message.finalized" {
 		status = "message." + strings.ToLower(payload.To[0].Status)
 	}
-	eventStatus, ok := normalizeTelnyxStatus(status)
+	eventStatus, ok := sms.NormalizeTelnyxStatus(status)
 	if !ok {
 		c.JSON(http.StatusOK, gin.H{"processed": 0})
 		return
@@ -1341,37 +1342,6 @@ func (s *Server) processSMSInbound(c *gin.Context, provider, eventID, phone, tex
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"processed": 1, "opted_out": optedOut})
-}
-
-func normalizeTwilioStatus(status string) (string, bool) {
-	switch strings.ToLower(status) {
-	case "queued", "accepted", "sending":
-		return "accepted", true
-	case "sent":
-		return "sent", true
-	case "delivered":
-		return "delivered", true
-	case "failed":
-		return "failed", true
-	case "undelivered":
-		return "undelivered", true
-	default:
-		return "", false
-	}
-}
-
-func normalizeTelnyxStatus(status string) (string, bool) {
-	switch strings.ToLower(status) {
-	case "message.sent", "message.queued", "message.accepted", "message.sending", "message.sending_started":
-		return "sent", true
-	case "message.delivered":
-		return "delivered", true
-	case "message.failed", "message.undelivered", "message.sending_failed",
-		"message.delivery_failed", "message.delivery_unconfirmed":
-		return "undelivered", true
-	default:
-		return "", false
-	}
 }
 
 func domainResponse(domain store.Domain) gin.H {

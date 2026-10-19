@@ -18,6 +18,7 @@ type TelnyxTransport struct {
 	from     string
 	callback string
 	client   *http.Client
+	endpoint string
 }
 
 func NewTelnyxTransport(apiKey, from, callback string) (*TelnyxTransport, error) {
@@ -29,6 +30,7 @@ func NewTelnyxTransport(apiKey, from, callback string) (*TelnyxTransport, error)
 		from:     from,
 		callback: callback,
 		client:   &http.Client{Timeout: 15 * time.Second},
+		endpoint: telnyxMessagesURL,
 	}
 	if callback != "" {
 		parsed, err := url.ParseRequestURI(callback)
@@ -70,7 +72,7 @@ func (t *TelnyxTransport) Send(ctx context.Context, message Message) (string, er
 	if err != nil {
 		return "", fmt.Errorf("encode Telnyx request: %w", err)
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, telnyxMessagesURL, bytes.NewReader(body))
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, t.endpoint, bytes.NewReader(body))
 	if err != nil {
 		return "", fmt.Errorf("create Telnyx request: %w", err)
 	}

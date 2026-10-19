@@ -49,6 +49,11 @@ type fakeRepository struct {
 	emailEvents           []store.EmailWebhookEvent
 	smsEvents             []store.SMSWebhookEvent
 	beginProviders        []string
+	unconfirmed           []store.UnconfirmedSMS
+}
+
+func (f *fakeRepository) ClaimUnconfirmedSMS(context.Context, string, int) ([]store.UnconfirmedSMS, error) {
+	return f.unconfirmed, nil
 }
 
 func (f *fakeRepository) ProcessEmailWebhookEvent(_ context.Context, event store.EmailWebhookEvent) (bool, error) {
@@ -720,5 +725,42 @@ func TestTestModeSMSStillChecksConsentButSkipsBudgets(t *testing.T) {
 		len(repository.smsEvents) != 1 || repository.smsEvents[0].Provider != "test" {
 		t.Fatalf("simulated SMS: complete=%d cost=%v capacity=%d events=%+v",
 			repository.smsComplete, repository.smsReservedCost, repository.senderCapacityCount, repository.smsEvents)
+	}
+}
+
+type statusSMSTransport struct {
+	fakeSMSTransport
+	statuses map[string]string
+}
+
+func (t *statusSMSTransport) Status(_ context.Context, providerMessageID string) (string, bool, error) {
+	status, ok := t.statuses[providerMessageID]
+	if !ok {
+		return "", false, errors.New("unknown message")
+	}
+	return status, status != "", nil
+}
+
+func TestReconcileSMSAppliesProviderStatuses(t *testing.T) {
+	delivered, unknown, failing := uuid.New(), uuid.New(), uuid.New()
+	repository := &fakeRepository{unconfirmed: []store.UnconfirmedSMS{
+		{MessageID: delivered, ProviderMessageID: "SM-delivered", Recipient: "+14155552671"},
+		{MessageID: unknown, ProviderMessageID: "SM-pending", Recipient: "+14155552671"},
+		{MessageID: failing, ProviderMessageID: "SM-error", Recipient: "+14155552671"},
+	}}
+	transport := &statusSMSTransport{statuses: map[string]string{"SM-delivered": "delivered", "SM-pending": ""}}
+	processor := NewProcessor(repository, nil, transport, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	applied, err := processor.ReconcileSMS(context.Background())
+	if err != nil || applied != 1 {
+		t.Fatalf("ReconcileSMS() = %d, %v; want 1 applied", applied, err)
+	}
+	if len(repository.smsEvents) != 1 || repository.smsEvents[0].MessageID != delivered ||
+		repository.smsEvents[0].EventType != "delivered" || repository.smsEvents[0].Provider != "test-sms" {
+		t.Fatalf("applied events = %+v", repository.smsEvents)
+	}
+
+	plain := NewProcessor(repository, nil, &fakeSMSTransport{}, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if applied, err := plain.ReconcileSMS(context.Background()); err != nil || applied != 0 {
+		t.Fatalf("transport without status support = %d, %v", applied, err)
 	}
 }

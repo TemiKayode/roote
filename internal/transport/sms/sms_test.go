@@ -160,3 +160,47 @@ func TestTwilioCallbackURLPreservesExistingQuery(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestProviderStatusLookups(t *testing.T) {
+	twilio, err := NewTwilioTransport("AC123", "token", "+15005550006", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	twilio.client = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.Method != http.MethodGet ||
+			request.URL.String() != "https://api.twilio.com/2010-04-01/Accounts/AC123/Messages/SM1.json" {
+			t.Errorf("Twilio status request = %s %s", request.Method, request.URL)
+		}
+		if user, password, ok := request.BasicAuth(); !ok || user != "AC123" || password != "token" {
+			t.Error("Twilio status request is not authenticated")
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"status":"undelivered"}`))}, nil
+	})}
+	status, ok, err := twilio.Status(context.Background(), "SM1")
+	if err != nil || !ok || status != "undelivered" {
+		t.Fatalf("Twilio status = %q, %t, %v", status, ok, err)
+	}
+
+	telnyx, err := NewTelnyxTransport("key", "+15005550006", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	telnyx.client = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.String() != "https://api.telnyx.com/v2/messages/msg-1" ||
+			request.Header.Get("Authorization") != "Bearer key" {
+			t.Errorf("Telnyx status request = %s %s", request.URL, request.Header.Get("Authorization"))
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(
+			`{"data":{"to":[{"status":"delivered"}]}}`))}, nil
+	})}
+	status, ok, err = telnyx.Status(context.Background(), "msg-1")
+	if err != nil || !ok || status != "delivered" {
+		t.Fatalf("Telnyx status = %q, %t, %v", status, ok, err)
+	}
+	telnyx.client = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusNotFound, Body: io.NopCloser(strings.NewReader(""))}, nil
+	})}
+	if _, _, err := telnyx.Status(context.Background(), "missing"); err == nil {
+		t.Fatal("Telnyx status for a 404 response returned no error")
+	}
+}

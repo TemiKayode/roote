@@ -113,6 +113,7 @@ func run() error {
 		return fmt.Errorf("parse configured account ID: %w", err)
 	}
 	go runRetention(ctx, database, accountID, cfg.RetentionDays, logger)
+	go runSMSReconciliation(ctx, processor, logger)
 	metricsMux := http.NewServeMux()
 	metricsMux.HandleFunc("/metrics", metrics.Handler)
 	metricsMux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -225,6 +226,35 @@ func runRetention(
 			return
 		case <-ticker.C:
 			run()
+		}
+	}
+}
+
+// runSMSReconciliation polls the SMS provider every five minutes for messages whose delivery
+// receipt is overdue, draining a backlog in consecutive batches.
+func runSMSReconciliation(ctx context.Context, processor *delivery.Processor, logger *slog.Logger) {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		for ctx.Err() == nil {
+			applied, err := processor.ReconcileSMS(ctx)
+			if err != nil {
+				if ctx.Err() == nil {
+					logger.ErrorContext(ctx, "SMS reconciliation failed", "error", err)
+				}
+				break
+			}
+			if applied > 0 {
+				logger.InfoContext(ctx, "reconciled SMS delivery statuses", "count", applied)
+			}
+			if applied == 0 {
+				break
+			}
 		}
 	}
 }

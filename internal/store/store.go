@@ -178,6 +178,10 @@ type OperationalSummary struct {
 	PendingOutbox    int64            `json:"pending_outbox"`
 	PendingWebhooks  int64            `json:"pending_webhooks"`
 	FailedWebhooks   int64            `json:"failed_webhooks"`
+	// Unconfirmed counts are provider-accepted messages with no delivery receipt after 24
+	// hours. A growing email count usually means the provider's event webhook is not configured.
+	UnconfirmedEmail int64 `json:"unconfirmed_email"`
+	UnconfirmedSMS   int64 `json:"unconfirmed_sms"`
 }
 
 func Open(ctx context.Context, databaseURL, accountID string) (*Store, error) {
@@ -494,9 +498,15 @@ func (s *Store) OperationalSummary(ctx context.Context, accountID uuid.UUID) (Op
 				 WHERE e.account_id = $1 AND d.status = 'pending'),
 				(SELECT count(*) FROM webhook_deliveries d
 				 JOIN webhook_endpoints e ON e.id = d.endpoint_id
-				 WHERE e.account_id = $1 AND d.status = 'failed')`,
+				 WHERE e.account_id = $1 AND d.status = 'failed'),
+				(SELECT count(*) FROM email_deliveries d JOIN messages m ON m.id = d.message_id
+				 WHERE m.account_id = $1 AND d.status = 'accepted' AND d.updated_at < now() - interval '24 hours'),
+				(SELECT count(*) FROM sms_deliveries d JOIN messages m ON m.id = d.message_id
+				 WHERE m.account_id = $1 AND d.status IN ('accepted', 'sent')
+				   AND d.updated_at < now() - interval '24 hours')`,
 		accountID,
-	).Scan(&summary.PendingOutbox, &summary.PendingWebhooks, &summary.FailedWebhooks)
+	).Scan(&summary.PendingOutbox, &summary.PendingWebhooks, &summary.FailedWebhooks,
+		&summary.UnconfirmedEmail, &summary.UnconfirmedSMS)
 	if err != nil {
 		return OperationalSummary{}, fmt.Errorf("query operational queue summary: %w", err)
 	}

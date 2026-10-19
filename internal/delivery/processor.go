@@ -50,6 +50,7 @@ type Repository interface {
 	MarkMessageFailed(context.Context, uuid.UUID, string) error
 	ProcessEmailWebhookEvent(context.Context, store.EmailWebhookEvent) (bool, error)
 	ProcessSMSWebhookEvent(context.Context, store.SMSWebhookEvent) (bool, error)
+	ClaimUnconfirmedSMS(context.Context, string, int) ([]store.UnconfirmedSMS, error)
 }
 
 type Processor struct {
@@ -548,6 +549,51 @@ func (p *Processor) SendSMSStopConfirmation(
 		return fmt.Errorf("send SMS opt-out confirmation: %w", err)
 	}
 	return nil
+}
+
+// reconcileBatchSize bounds provider status lookups per reconciliation pass.
+const reconcileBatchSize = 50
+
+// ReconcileSMS asks the SMS provider for the status of messages whose delivery receipt has not
+// arrived and applies each answer as a receipt would. It returns how many statuses were
+// applied. Transports that cannot report status are skipped.
+func (p *Processor) ReconcileSMS(ctx context.Context) (int, error) {
+	checker, ok := p.smsTransport.(sms.StatusChecker)
+	if !ok {
+		return 0, nil
+	}
+	provider := p.smsTransport.Provider()
+	pending, err := p.repository.ClaimUnconfirmedSMS(ctx, provider, reconcileBatchSize)
+	if err != nil {
+		return 0, err
+	}
+	applied := 0
+	for _, message := range pending {
+		status, known, err := checker.Status(ctx, message.ProviderMessageID)
+		if err != nil {
+			p.logger.WarnContext(ctx, "could not fetch SMS status for reconciliation",
+				"message_id", message.MessageID, "provider", provider, "error", err)
+			continue
+		}
+		if !known {
+			continue
+		}
+		changed, err := p.repository.ProcessSMSWebhookEvent(ctx, store.SMSWebhookEvent{
+			ProviderEventID:   "reconcile:" + message.ProviderMessageID + ":" + status,
+			ProviderMessageID: message.ProviderMessageID,
+			Provider:          provider,
+			MessageID:         message.MessageID,
+			Recipient:         message.Recipient,
+			EventType:         status,
+		})
+		if err != nil {
+			return applied, fmt.Errorf("apply reconciled SMS status: %w", err)
+		}
+		if changed {
+			applied++
+		}
+	}
+	return applied, nil
 }
 
 // testProvider names the simulated provider used for test-mode messages.

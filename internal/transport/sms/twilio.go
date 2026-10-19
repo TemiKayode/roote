@@ -19,6 +19,7 @@ type TwilioTransport struct {
 	from       string
 	callback   string
 	client     *http.Client
+	baseURL    string
 }
 
 func NewTwilioTransport(accountSID, authToken, from, callback string) (*TwilioTransport, error) {
@@ -31,6 +32,7 @@ func NewTwilioTransport(accountSID, authToken, from, callback string) (*TwilioTr
 		from:       from,
 		callback:   callback,
 		client:     &http.Client{Timeout: 15 * time.Second},
+		baseURL:    twilioMessagesURL,
 	}
 	if callback != "" {
 		parsed, err := url.ParseRequestURI(callback)
@@ -64,7 +66,7 @@ func (t *TwilioTransport) Send(ctx context.Context, message Message) (string, er
 		callback.RawQuery = query.Encode()
 		form.Set("StatusCallback", callback.String())
 	}
-	endpoint := twilioMessagesURL + url.PathEscape(t.accountSID) + "/Messages.json"
+	endpoint := t.messagesEndpoint() + ".json"
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
 	if err != nil {
 		return "", fmt.Errorf("create Twilio request: %w", err)
@@ -93,4 +95,8 @@ func (t *TwilioTransport) Send(ctx context.Context, message Message) (string, er
 		return "", &DeliveryError{Err: err, Temporary: true}
 	}
 	return result.SID, nil
+}
+
+func (t *TwilioTransport) messagesEndpoint() string {
+	return t.baseURL + url.PathEscape(t.accountSID) + "/Messages"
 }
