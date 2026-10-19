@@ -18,6 +18,8 @@ import (
 
 	"github.com/TemiKayode/roote/internal/secret"
 	"github.com/TemiKayode/roote/internal/store"
+
+	"github.com/TemiKayode/roote/internal/observability"
 )
 
 type Sender struct {
@@ -39,7 +41,7 @@ func NewSender(encryptionKey []byte, previous ...[]byte) *Sender {
 			CheckRedirect: func(*http.Request, []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
-			Transport: &http.Transport{DialContext: safeDialContext},
+			Transport: observability.ClientTransport(&http.Transport{DialContext: safeDialContext}),
 		},
 	}
 }

@@ -9,6 +9,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/TemiKayode/roote/internal/observability"
 )
 
 const twilioMessagesURL = "https://api.twilio.com/2010-04-01/Accounts/"
@@ -31,7 +33,7 @@ func NewTwilioTransport(accountSID, authToken, from, callback string) (*TwilioTr
 		authToken:  authToken,
 		from:       from,
 		callback:   callback,
-		client:     &http.Client{Timeout: 15 * time.Second},
+		client:     &http.Client{Timeout: 15 * time.Second, Transport: observability.ClientTransport(nil)},
 		baseURL:    twilioMessagesURL,
 	}
 	if callback != "" {

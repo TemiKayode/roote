@@ -12,6 +12,9 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
+	"go.opentelemetry.io/otel/attribute"
+
+	"github.com/TemiKayode/roote/internal/observability"
 )
 
 const TaskNotificationDelivery = "notification:deliver"
@@ -72,7 +75,8 @@ func notificationQueue(base, trafficClass string) string {
 }
 
 type notificationPayload struct {
-	MessageID string `json:"message_id"`
+	MessageID   string `json:"message_id"`
+	TraceParent string `json:"trace_parent,omitempty"`
 }
 
 type domainVerificationPayload struct {
@@ -95,9 +99,9 @@ func EnqueueNotification(
 	client *asynq.Client,
 	baseQueue string,
 	messageID uuid.UUID,
-	trafficClass string,
+	trafficClass, traceParent string,
 ) error {
-	payload, err := json.Marshal(notificationPayload{MessageID: messageID.String()})
+	payload, err := json.Marshal(notificationPayload{MessageID: messageID.String(), TraceParent: traceParent})
 	if err != nil {
 		return fmt.Errorf("marshal notification task: %w", err)
 	}
@@ -206,7 +210,11 @@ func NewServeMux(
 		if handleNotification == nil {
 			return fmt.Errorf("notification handler is not configured")
 		}
-		return handleNotification(ctx, messageID)
+		ctx, span := observability.StartTaskSpan(ctx, TaskNotificationDelivery, payload.TraceParent)
+		span.SetAttributes(attribute.String("roote.message_id", messageID.String()))
+		err := handleNotification(ctx, messageID)
+		observability.EndSpan(span, err)
+		return err
 	})
 	mux.HandleFunc(TaskDomainVerification, func(ctx context.Context, task *asynq.Task) error {
 		var payload domainVerificationPayload
@@ -224,7 +232,10 @@ func NewServeMux(
 			return fmt.Errorf("domain verification handler is not configured")
 		}
 		logger.InfoContext(ctx, "domain DNS verification started", "domain_id", domainID)
-		return handleDomainVerification(ctx, payload.AccountID, domainID)
+		ctx, span := observability.StartTaskSpan(ctx, TaskDomainVerification, "")
+		err = handleDomainVerification(ctx, payload.AccountID, domainID)
+		observability.EndSpan(span, err)
+		return err
 	})
 	mux.HandleFunc(TaskSMSStopConfirmation, func(ctx context.Context, task *asynq.Task) error {
 		var payload smsStopConfirmationPayload
@@ -238,7 +249,10 @@ func NewServeMux(
 			return errors.New("SMS stop confirmation handler is not configured")
 		}
 		logger.InfoContext(ctx, "sending SMS opt-out confirmation", "provider", payload.Provider)
-		return handleSMSStopConfirmation(ctx, payload.Provider, payload.Phone, payload.EventID)
+		ctx, span := observability.StartTaskSpan(ctx, TaskSMSStopConfirmation, "")
+		err := handleSMSStopConfirmation(ctx, payload.Provider, payload.Phone, payload.EventID)
+		observability.EndSpan(span, err)
+		return err
 	})
 	mux.HandleFunc(TaskWebhookDelivery, func(ctx context.Context, task *asynq.Task) error {
 		var payload webhookDeliveryPayload
@@ -252,7 +266,11 @@ func NewServeMux(
 		if handleWebhookDelivery == nil {
 			return errors.New("webhook delivery handler is not configured")
 		}
-		return handleWebhookDelivery(ctx, deliveryID)
+		ctx, span := observability.StartTaskSpan(ctx, TaskWebhookDelivery, "")
+		span.SetAttributes(attribute.String("roote.webhook_delivery_id", deliveryID.String()))
+		err = handleWebhookDelivery(ctx, deliveryID)
+		observability.EndSpan(span, err)
+		return err
 	})
 	return mux
 }

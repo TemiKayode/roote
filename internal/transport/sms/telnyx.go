@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/url"
 	"time"
+
+	"github.com/TemiKayode/roote/internal/observability"
 )
 
 const telnyxMessagesURL = "https://api.telnyx.com/v2/messages"
@@ -29,7 +31,7 @@ func NewTelnyxTransport(apiKey, from, callback string) (*TelnyxTransport, error)
 		apiKey:   apiKey,
 		from:     from,
 		callback: callback,
-		client:   &http.Client{Timeout: 15 * time.Second},
+		client:   &http.Client{Timeout: 15 * time.Second, Transport: observability.ClientTransport(nil)},
 		endpoint: telnyxMessagesURL,
 	}
 	if callback != "" {

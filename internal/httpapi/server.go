@@ -709,6 +709,7 @@ func (s *Server) createNotification(c *gin.Context) {
 	messageID, duplicate, err := s.store.Accept(c.Request.Context(), store.Acceptance{
 		AccountID: accountID.String(), IdempotencyKey: idempotencyKey, Notification: notification,
 		Payload: payload, RequestHash: requestHash[:], TestMode: testMode(c),
+		TraceParent: observability.TraceParent(c.Request.Context()),
 		Audit: &store.AuditEvent{
 			AccountID: accountID, APIKeyID: apiKeyID(c), Action: "notification.accepted",
 			Resource: "message", RequestID: observability.RequestID(c),

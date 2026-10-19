@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/TemiKayode/roote/internal/observability"
 )
 
 type SendGridTransport struct {
@@ -26,7 +28,7 @@ func NewSendGridTransport(apiKey, transactionalPool, marketingPool string) (*Sen
 	}
 	return &SendGridTransport{
 		apiKey:          apiKey,
-		client:          &http.Client{Timeout: 15 * time.Second},
+		client:          &http.Client{Timeout: 15 * time.Second, Transport: observability.ClientTransport(nil)},
 		endpoint:        "https://api.sendgrid.com/v3/mail/send",
 		transactionPool: transactionalPool,
 		marketingPool:   marketingPool,

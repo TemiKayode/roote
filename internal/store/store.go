@@ -2109,6 +2109,9 @@ type Acceptance struct {
 	// TestMode messages are simulated by the worker and never reach a provider. Test and live
 	// messages have separate idempotency keys.
 	TestMode bool
+	// TraceParent is the W3C traceparent of the accepting request, stored with the outbox row
+	// so the worker's delivery spans join the same trace.
+	TraceParent string
 	// Audit, when non-nil, is written in the same transaction as a newly accepted message
 	// with ResourceID set to the message ID. Idempotent replays are not audited again.
 	Audit *AuditEvent
@@ -2172,8 +2175,8 @@ func (s *Store) Accept(ctx context.Context, acceptance Acceptance) (uuid.UUID, b
 		return uuid.Nil, false, err
 	}
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO outbox (message_id, task_type)
-		VALUES ($1, 'notification:deliver')`, messageID); err != nil {
+		INSERT INTO outbox (message_id, task_type, trace_parent)
+		VALUES ($1, 'notification:deliver', NULLIF($2, ''))`, messageID, acceptance.TraceParent); err != nil {
 		return uuid.Nil, false, fmt.Errorf("insert notification outbox event: %w", err)
 	}
 	if audit != nil {
@@ -2193,13 +2196,20 @@ func (s *Store) Accept(ctx context.Context, acceptance Acceptance) (uuid.UUID, b
 	return messageID, false, nil
 }
 
+// OutboxItem is an accepted notification waiting to be queued for delivery.
+type OutboxItem struct {
+	MessageID    uuid.UUID
+	TrafficClass string
+	TraceParent  string
+}
+
 // RelayOutboxBatch enqueues up to relayBatchSize unpublished notification outbox rows, in
 // the order they were accepted, and returns how many were enqueued. Rows are marked published
 // only after their enqueue succeeds; on an enqueue error the rows already enqueued are still
 // marked and the error is returned.
 func (s *Store) RelayOutboxBatch(
 	ctx context.Context,
-	enqueue func(ctx context.Context, messageID uuid.UUID, trafficClass string) error,
+	enqueue func(context.Context, OutboxItem) error,
 ) (int, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
@@ -2208,7 +2218,7 @@ func (s *Store) RelayOutboxBatch(
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	rows, err := tx.Query(ctx, `
-		SELECT o.message_id, COALESCE(m.payload->>'traffic_class', '')
+		SELECT o.message_id, COALESCE(m.payload->>'traffic_class', ''), COALESCE(o.trace_parent, '')
 		FROM outbox o
 		JOIN messages m ON m.id = o.message_id
 		WHERE o.published_at IS NULL
@@ -2218,18 +2228,14 @@ func (s *Store) RelayOutboxBatch(
 	if err != nil {
 		return 0, fmt.Errorf("select outbox rows: %w", err)
 	}
-	type pending struct {
-		MessageID    uuid.UUID
-		TrafficClass string
-	}
-	batch, err := pgx.CollectRows(rows, pgx.RowToStructByPos[pending])
+	batch, err := pgx.CollectRows(rows, pgx.RowToStructByPos[OutboxItem])
 	if err != nil {
 		return 0, fmt.Errorf("read outbox rows: %w", err)
 	}
 	published := make([]uuid.UUID, 0, len(batch))
 	var enqueueErr error
 	for _, row := range batch {
-		if err := enqueue(ctx, row.MessageID, row.TrafficClass); err != nil {
+		if err := enqueue(ctx, row); err != nil {
 			enqueueErr = fmt.Errorf("enqueue message %s: %w", row.MessageID, err)
 			break
 		}
@@ -2251,7 +2257,7 @@ func (s *Store) RelayOutboxBatch(
 // RunOutboxRelay relays accepted notifications to the queue until ctx is cancelled.
 func (s *Store) RunOutboxRelay(
 	ctx context.Context,
-	enqueue func(ctx context.Context, messageID uuid.UUID, trafficClass string) error,
+	enqueue func(context.Context, OutboxItem) error,
 	logger *slog.Logger,
 ) {
 	s.runRelay(ctx, outboxNotifyChannel, "outbox relay", func(ctx context.Context) (int, error) {

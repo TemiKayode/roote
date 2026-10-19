@@ -38,9 +38,9 @@ func TestOutboxBatchRelaysInOrderWithTrafficClass(t *testing.T) {
 
 	var order []uuid.UUID
 	classes := map[uuid.UUID]string{}
-	relayed, err := repository.RelayOutboxBatch(ctx, func(_ context.Context, id uuid.UUID, trafficClass string) error {
-		order = append(order, id)
-		classes[id] = trafficClass
+	relayed, err := repository.RelayOutboxBatch(ctx, func(_ context.Context, item OutboxItem) error {
+		order = append(order, item.MessageID)
+		classes[item.MessageID] = item.TrafficClass
 		return nil
 	})
 	if err != nil || relayed != 2 || len(order) != 2 || order[0] != first || order[1] != second {
@@ -49,7 +49,7 @@ func TestOutboxBatchRelaysInOrderWithTrafficClass(t *testing.T) {
 	if classes[first] != "" || classes[second] != "marketing" {
 		t.Fatalf("traffic classes = %v", classes)
 	}
-	again, err := repository.RelayOutboxBatch(ctx, func(context.Context, uuid.UUID, string) error {
+	again, err := repository.RelayOutboxBatch(ctx, func(context.Context, OutboxItem) error {
 		t.Fatal("published rows were relayed again")
 		return nil
 	})
@@ -63,8 +63,8 @@ func TestOutboxBatchMarksOnlyEnqueuedRowsOnFailure(t *testing.T) {
 	drainOutbox(t, ctx, repository)
 	first := acceptEmail(t, ctx, repository, accountID, "partial-1", "")
 	second := acceptEmail(t, ctx, repository, accountID, "partial-2", "")
-	relayed, err := repository.RelayOutboxBatch(ctx, func(_ context.Context, id uuid.UUID, _ string) error {
-		if id == second {
+	relayed, err := repository.RelayOutboxBatch(ctx, func(_ context.Context, item OutboxItem) error {
+		if item.MessageID == second {
 			return fmt.Errorf("redis unavailable")
 		}
 		return nil
@@ -91,8 +91,8 @@ func TestOutboxRelayWakesOnNotify(t *testing.T) {
 	relayCtx, stop := context.WithCancel(ctx)
 	defer stop()
 	enqueued := make(chan uuid.UUID, 10)
-	go repository.RunOutboxRelay(relayCtx, func(_ context.Context, id uuid.UUID, _ string) error {
-		enqueued <- id
+	go repository.RunOutboxRelay(relayCtx, func(_ context.Context, item OutboxItem) error {
+		enqueued <- item.MessageID
 		return nil
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	// Let the relay drain and start waiting, then accept a message well inside the poll interval.

@@ -38,6 +38,11 @@ func run() error {
 		return fmt.Errorf("load configuration: %w", err)
 	}
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
+	shutdownTracing, err := observability.SetupTracing(context.Background(), "roote-worker")
+	if err != nil {
+		return fmt.Errorf("configure tracing: %w", err)
+	}
+	defer flushTraces(shutdownTracing, logger)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -102,8 +107,8 @@ func run() error {
 	)); err != nil {
 		return fmt.Errorf("start Asynq server: %w", err)
 	}
-	go database.RunOutboxRelay(ctx, func(ctx context.Context, messageID uuid.UUID, trafficClass string) error {
-		return queue.EnqueueNotification(ctx, client, cfg.AsynqQueue, messageID, trafficClass)
+	go database.RunOutboxRelay(ctx, func(ctx context.Context, item store.OutboxItem) error {
+		return queue.EnqueueNotification(ctx, client, cfg.AsynqQueue, item.MessageID, item.TrafficClass, item.TraceParent)
 	}, logger)
 	go database.RunWebhookRelay(ctx, func(ctx context.Context, deliveryID uuid.UUID) error {
 		return queue.EnqueueWebhookDelivery(ctx, client, cfg.AsynqQueue, deliveryID)
@@ -174,6 +179,16 @@ func run() error {
 	}
 	logger.Info("worker stopped")
 	return metricsServerErr
+}
+
+// flushTraces exports spans still buffered at shutdown, bounded so a stuck collector
+// cannot hold the process open.
+func flushTraces(shutdown func(context.Context) error, logger *slog.Logger) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := shutdown(ctx); err != nil {
+		logger.Error("could not flush traces", "error", err)
+	}
 }
 
 func redisv9Client(address string) *redis.Client {
