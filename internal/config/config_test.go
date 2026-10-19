@@ -18,7 +18,7 @@ func setBaseEnvironment(t *testing.T) {
 	t.Setenv("SMS_WARMUP_MAXIMUM_LIMIT", "")
 	t.Setenv("DATABASE_URL", "postgres://user:pass@localhost/notify")
 	t.Setenv("REDIS_URL", "localhost:6379")
-	t.Setenv("ACCOUNT_ID", "account")
+	t.Setenv("ACCOUNT_ID", "00000000-0000-4000-8000-000000000001")
 	t.Setenv("ASYNQ_QUEUE", "notifications")
 	t.Setenv("LOG_LEVEL", "info")
 	t.Setenv("DKIM_ENCRYPTION_KEY", "")

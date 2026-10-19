@@ -31,6 +31,7 @@ var (
 	ErrSMSCountryBudget    = errors.New("SMS country monthly budget exceeded")
 	ErrSMSConsentRequired  = errors.New("active SMS consent is required")
 	ErrSenderCapacity      = errors.New("sender daily warm-up capacity exceeded")
+	ErrWebhookMismatch     = errors.New("provider webhook does not match the stored delivery")
 )
 
 type Store struct {
@@ -808,7 +809,7 @@ func (s *Store) RelayOneWebhook(
 	err = tx.QueryRow(ctx, `
 		SELECT id FROM webhook_deliveries
 		WHERE status = 'pending'
-		  AND (queued_at IS NULL OR queued_at < now() - interval '30 minutes')
+		  AND (queued_at IS NULL OR queued_at < now() - interval '2 hours')
 		ORDER BY created_at
 		FOR UPDATE SKIP LOCKED LIMIT 1`).Scan(&deliveryID)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -823,9 +824,11 @@ func (s *Store) RelayOneWebhook(
 	if err := enqueue(ctx, deliveryID); err != nil {
 		return false, fmt.Errorf("enqueue webhook delivery %s: %w", deliveryID, err)
 	}
+	// Refresh queued_at on every relay. A stale pending delivery is usually still waiting in a
+	// long Asynq retry backoff; without the refresh it would be reselected on every loop and
+	// starve newer deliveries.
 	if _, err := tx.Exec(ctx, `
-		UPDATE webhook_deliveries SET queued_at = now()
-		WHERE id = $1 AND queued_at IS NULL`, deliveryID); err != nil {
+		UPDATE webhook_deliveries SET queued_at = now() WHERE id = $1`, deliveryID); err != nil {
 		return false, fmt.Errorf("mark webhook delivery enqueued: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -1320,10 +1323,10 @@ func (s *Store) ProcessSMSWebhookEvent(ctx context.Context, event SMSWebhookEven
 		return false, fmt.Errorf("load SMS delivery for webhook: %w", err)
 	}
 	if recipient != event.Recipient {
-		return false, errors.New("SMS webhook recipient does not match message")
+		return false, fmt.Errorf("%w: SMS recipient differs", ErrWebhookMismatch)
 	}
 	if provider != event.Provider || providerMessageID == "" || providerMessageID != event.ProviderMessageID {
-		return false, errors.New("SMS webhook provider message does not match delivery")
+		return false, fmt.Errorf("%w: SMS provider message differs", ErrWebhookMismatch)
 	}
 	tag, err := tx.Exec(ctx, `
 		INSERT INTO sms_webhook_events (provider_event_id, message_id, event_type)
@@ -1653,6 +1656,12 @@ func reconcileMessageStatus(ctx context.Context, tx pgx.Tx, messageID uuid.UUID)
 		UPDATE messages AS m
 		SET status = (
 			SELECT CASE
+				-- A waterfall succeeds when any channel delivers once every channel is settled;
+				-- earlier synchronous failures are the reason the fallback ran.
+				WHEN m.payload->'routing'->>'strategy' = 'waterfall'
+					AND COUNT(*) FILTER (WHERE channel_status = 'delivered') > 0
+					AND COUNT(*) FILTER (WHERE channel_status IN ('delivered', 'failed', 'undelivered', 'skipped')) = COUNT(*)
+					THEN 'delivered'
 				WHEN COUNT(*) FILTER (WHERE channel_status != 'skipped') > 0
 					AND COUNT(*) FILTER (WHERE channel_status IN ('delivered', 'skipped')) = COUNT(*)
 					THEN 'delivered'
@@ -1662,15 +1671,14 @@ func reconcileMessageStatus(ctx context.Context, tx pgx.Tx, messageID uuid.UUID)
 				WHEN COUNT(*) FILTER (WHERE channel_status IN ('failed', 'undelivered', 'skipped')) = COUNT(*)
 					AND COUNT(*) FILTER (WHERE channel_status = 'failed' OR channel_status = 'undelivered') > 0
 					THEN 'failed'
-				WHEN BOOL_OR(channel_status = 'sending') THEN 'processing'
+				WHEN BOOL_OR(channel_status IN ('sending', 'accepted')) THEN 'processing'
 				ELSE 'queued'
 			END
 			FROM (
 				SELECT requested.channel,
 					CASE requested.channel
 						WHEN 'email' THEN COALESCE(
-							(SELECT CASE status WHEN 'sending' THEN 'sending' ELSE status END
-							 FROM email_deliveries WHERE message_id = m.id),
+							(SELECT status FROM email_deliveries WHERE message_id = m.id),
 							(SELECT status FROM delivery_attempts WHERE message_id = m.id AND channel = 'email'
 							 ORDER BY attempt_number DESC LIMIT 1))
 						WHEN 'sms' THEN COALESCE(
@@ -1914,7 +1922,7 @@ func (s *Store) ProcessEmailWebhookEvent(ctx context.Context, event EmailWebhook
 	}
 	if !contains(notification.Channels, "email") ||
 		!stringsEqualFold(notification.Recipient.Email, event.Recipient) {
-		return false, errors.New("email webhook recipient does not match message")
+		return false, fmt.Errorf("%w: email recipient differs", ErrWebhookMismatch)
 	}
 
 	tag, err := tx.Exec(ctx, `

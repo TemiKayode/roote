@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
+	"github.com/jackc/pgx/v5"
 	"github.com/nyaruka/phonenumbers"
 
 	"github.com/TemiKayode/roote/internal/config"
@@ -94,6 +95,10 @@ func (p *Processor) DeliverNotification(ctx context.Context, messageID uuid.UUID
 	emailJob, emailErr := p.repository.GetEmailJob(ctx, messageID)
 	smsJob, smsErr := p.repository.GetSMSJob(ctx, messageID)
 	if emailErr != nil && smsErr != nil {
+		if errors.Is(emailErr, pgx.ErrNoRows) && errors.Is(smsErr, pgx.ErrNoRows) {
+			// The message was deleted (explicitly or by retention) before delivery ran.
+			return fmt.Errorf("%w: notification %s no longer exists", asynq.SkipRetry, messageID)
+		}
 		return fmt.Errorf("load notification for delivery: %w", errors.Join(emailErr, smsErr))
 	}
 	if emailErr != nil && contains(smsJob.Channels, "email") {
@@ -109,9 +114,9 @@ func (p *Processor) DeliverNotification(ctx context.Context, messageID uuid.UUID
 	if !contains(channels, "email") && !contains(channels, "sms") {
 		return p.failPermanently(ctx, messageID, "notification has no supported delivery channel")
 	}
-	routing := emailJob.Routing
+	routing, accountID := emailJob.Routing, emailJob.AccountID
 	if emailErr != nil {
-		routing = smsJob.Routing
+		routing, accountID = smsJob.Routing, smsJob.AccountID
 	}
 	strategy := routing.Strategy
 	if strategy == "" {
@@ -125,7 +130,7 @@ func (p *Processor) DeliverNotification(ctx context.Context, messageID uuid.UUID
 			if channel == "sms" {
 				recipient = smsJob.Recipient
 			}
-			preferred, err := p.repository.IsNotificationPreferred(ctx, smsJob.AccountID, recipient, channel)
+			preferred, err := p.repository.IsNotificationPreferred(ctx, accountID, recipient, channel)
 			if err != nil {
 				return fmt.Errorf("check %s notification preference: %w", channel, err)
 			}
@@ -163,9 +168,16 @@ func (p *Processor) DeliverNotification(ctx context.Context, messageID uuid.UUID
 			ordered = channels
 		}
 		var failures []error
-		for _, channel := range ordered {
+		for index, channel := range ordered {
 			err := p.deliverChannel(ctx, channel, messageID, emailJob)
 			if err == nil {
+				// Settle the channels the waterfall did not need so the message can reach a
+				// terminal status once the delivering channel confirms.
+				for _, remaining := range ordered[index+1:] {
+					if err := p.repository.RecordChannelSkipped(ctx, messageID, remaining); err != nil {
+						return err
+					}
+				}
 				return nil
 			}
 			failures = append(failures, fmt.Errorf("%s delivery: %w", channel, err))
@@ -275,8 +287,11 @@ func (p *Processor) deliverEmail(ctx context.Context, job store.EmailJob) error 
 		return p.failChannelPermanently(ctx, messageID, "email", "configured EMAIL_FROM has no domain")
 	}
 	dkimKey, err := p.repository.GetDKIMKey(ctx, job.AccountID, strings.ToLower(parts[1]))
-	if err != nil {
+	if errors.Is(err, pgx.ErrNoRows) {
 		return p.failChannelPermanently(ctx, messageID, "email", "sender domain has not been verified")
+	}
+	if err != nil {
+		return fmt.Errorf("load sender DKIM key: %w", err)
 	}
 	privateKeyPEM, err := emaildomain.DecryptPrivateKey(p.config.DKIMEncryptionKey, dkimKey.EncryptedPrivateKey)
 	if err != nil {

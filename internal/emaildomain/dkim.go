@@ -1,18 +1,17 @@
 package emaildomain
 
 import (
-	"crypto/aes"
-	"crypto/cipher"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/pem"
-	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/google/uuid"
+
+	"github.com/TemiKayode/roote/internal/secret"
 )
 
 type DNSRecord struct {
@@ -49,42 +48,18 @@ func GenerateKeyMaterial() (KeyMaterial, error) {
 	}, nil
 }
 
+// EncryptPrivateKey seals a DKIM private key with AES-256-GCM.
 func EncryptPrivateKey(key, plaintext []byte) ([]byte, error) {
-	if len(key) != 32 {
-		return nil, errors.New("DKIM encryption key must be exactly 32 bytes")
-	}
-	block, err := aes.NewCipher(key)
+	ciphertext, err := secret.Encrypt(key, plaintext)
 	if err != nil {
-		return nil, fmt.Errorf("create DKIM encryption cipher: %w", err)
+		return nil, fmt.Errorf("encrypt DKIM private key: %w", err)
 	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, fmt.Errorf("create DKIM encryption mode: %w", err)
-	}
-	nonce := make([]byte, gcm.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, fmt.Errorf("generate DKIM encryption nonce: %w", err)
-	}
-	return gcm.Seal(nonce, nonce, plaintext, nil), nil
+	return ciphertext, nil
 }
 
+// DecryptPrivateKey opens a DKIM private key sealed by EncryptPrivateKey.
 func DecryptPrivateKey(key, ciphertext []byte) ([]byte, error) {
-	if len(key) != 32 {
-		return nil, errors.New("DKIM encryption key must be exactly 32 bytes")
-	}
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, fmt.Errorf("create DKIM decryption cipher: %w", err)
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, fmt.Errorf("create DKIM decryption mode: %w", err)
-	}
-	if len(ciphertext) < gcm.NonceSize() {
-		return nil, errors.New("DKIM ciphertext is too short")
-	}
-	nonce, encrypted := ciphertext[:gcm.NonceSize()], ciphertext[gcm.NonceSize():]
-	plaintext, err := gcm.Open(nil, nonce, encrypted, nil)
+	plaintext, err := secret.Decrypt(key, ciphertext)
 	if err != nil {
 		return nil, fmt.Errorf("decrypt DKIM private key: %w", err)
 	}

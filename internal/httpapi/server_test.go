@@ -220,6 +220,21 @@ func TestAPIKeyAuthenticationScopesAndRequestMetrics(t *testing.T) {
 	}
 	scrape := httptest.NewRecorder()
 	router.ServeHTTP(scrape, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if scrape.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated metrics status = %d, want %d", scrape.Code, http.StatusUnauthorized)
+	}
+	consent := httptest.NewRequest(http.MethodPost, "/v1/consents/sms",
+		strings.NewReader(`{"phone":"+14155552671","scope":"all","source":"attacker","consented":true}`))
+	consentResponse := httptest.NewRecorder()
+	router.ServeHTTP(consentResponse, consent)
+	if consentResponse.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated consent status = %d, want %d", consentResponse.Code, http.StatusUnauthorized)
+	}
+	authenticator.key.Scopes = []string{"ops:read"}
+	scrapeRequest := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	scrapeRequest.Header.Set("Authorization", "Bearer "+token)
+	scrape = httptest.NewRecorder()
+	router.ServeHTTP(scrape, scrapeRequest)
 	if scrape.Code != http.StatusOK ||
 		!strings.Contains(scrape.Body.String(), `route="/v1/notifications"`) ||
 		!strings.Contains(scrape.Body.String(), "roote_http_request_duration_seconds_bucket") {
@@ -511,9 +526,13 @@ func TestSendGridWebhookOnlyProcessesSignedHardEvents(t *testing.T) {
 		EmailFeatures{DomainStore: domains, WebhookVerifier: acceptingWebhookVerifier{}},
 	)
 	messageID := uuid.New()
-	body := `[{"event":"bounce","type":"bounce","status":"5.1.1","email":"person@example.net","sg_event_id":"event-bounce","custom_args":{"message_id":"` +
-		messageID.String() + `"}},{"event":"bounce","type":"blocked","status":"5.7.1","email":"other@example.net","sg_event_id":"event-blocked"},{"event":"spamreport","email":"person@example.net","sg_event_id":"event-complaint","custom_args":{"message_id":"` +
-		messageID.String() + `"}}]`
+	// SendGrid returns custom_args as top-level event properties. The delivered event for
+	// mail sent outside this service has no message_id and must not fail the batch.
+	body := `[{"event":"bounce","type":"bounce","status":"5.1.1","email":"person@example.net","sg_event_id":"event-bounce","message_id":"` +
+		messageID.String() + `"},{"event":"bounce","type":"blocked","status":"5.7.1","email":"other@example.net","sg_event_id":"event-blocked"},` +
+		`{"event":"delivered","email":"external@example.net","sg_event_id":"event-external"},` +
+		`{"event":"spamreport","email":"person@example.net","sg_event_id":"event-complaint","message_id":"` +
+		messageID.String() + `"}]`
 	request := httptest.NewRequest(http.MethodPost, "/internal/webhooks/email", strings.NewReader(body))
 	request.Header.Set("X-Twilio-Email-Event-Webhook-Signature", "valid")
 	request.Header.Set("X-Twilio-Email-Event-Webhook-Timestamp", "123")

@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/TemiKayode/roote/internal/store"
 )
@@ -36,7 +37,13 @@ func (h *Handler) Handle(
 ) error {
 	delivery, err := h.repository.GetWebhookDelivery(ctx, deliveryID)
 	if err != nil {
-		if recordErr := h.repository.RecordWebhookAttempt(ctx, deliveryID, "failed", 0, err.Error()); recordErr != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("load customer webhook delivery: %w", err)
+		}
+		// The delivery or its message was deleted, or the endpoint was deactivated.
+		if recordErr := h.repository.RecordWebhookAttempt(
+			ctx, deliveryID, "failed", 0, err.Error(),
+		); recordErr != nil && !errors.Is(recordErr, pgx.ErrNoRows) {
 			return errors.Join(err, recordErr)
 		}
 		return fmt.Errorf("%w: %v", asynq.SkipRetry, err)

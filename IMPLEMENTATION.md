@@ -68,13 +68,28 @@ Acceptance: a valid request receives `202` and a stable message ID; replaying th
 - [x] Document authentication, provisioning, limits, queue recovery, secret handling, backups, migrations, and incident response.
 - [x] Run PostgreSQL-backed M5 lifecycle checks and deployment/runtime smoke tests before release.
 
+Verified on 2026-10-19: all store integration tests pass against PostgreSQL 17 with migrations 1–6, and an `api_key`-mode Compose stack passed a smoke test covering key creation/revocation, scope enforcement, idempotent replay/conflict, waterfall fallback, terminal failure, dead-letter listing, audit events, worker readiness/metrics, and graceful shutdown.
+
+### Review fixes (2026-10-19)
+
+- `POST /v1/consents/sms` now requires the `consents:write` scope; it was previously reachable without an API key in `api_key` mode.
+- SendGrid Event Webhook `custom_args` are read from top-level event properties, as SendGrid sends them. Events without a `message_id`, or for deleted/mismatched messages, are skipped individually instead of failing the whole batch; SMS status callbacks for deleted messages return `200` with `processed: 0`.
+- The customer webhook relay refreshes `queued_at` on every relay. Previously a delivery waiting in a long Asynq retry backoff was reselected on every loop, starving newer deliveries.
+- Waterfall routing records unattempted channels as skipped, and a waterfall whose fallback delivers is `delivered` rather than `partially_delivered`. Previously a waterfall whose first channel succeeded never reached a terminal status.
+- A provider-accepted message reports `processing` until a delivery receipt arrives; it no longer regresses to `queued`.
+- Deleted messages are not retried by the worker; transient DKIM-key and webhook-delivery lookup errors are retried instead of being recorded as permanent failures.
+- Customer webhook URLs and resolved addresses block all special-purpose ranges, including CGNAT (`100.64.0.0/10`) and NAT64 (`64:ff9b::/96`).
+- `GET /metrics` on the API requires `ops:read` in `api_key` mode.
+- SPF verification checks that each required mechanism is present, so records merged with other providers or using `-all` verify.
+- `ACCOUNT_ID` must be a UUID at startup. Migration 6 backfills `webhook_deliveries.source_message_id` so retention and deletion cascade to pre-M5 webhook rows, and indexes case-insensitive suppression and preference lookups.
+
 ## Build steps
 
 1. Install Go 1.24+ and Docker Desktop with Compose.
 2. From the repository root, copy `.env.example` to `.env`. Keep `.env` out of version control; `.gitignore` already excludes it.
 3. Generate persistent 32-byte keys and set `DKIM_ENCRYPTION_KEY` and `WEBHOOK_ENCRYPTION_KEY` to their standard-base64 encodings. The webhook key is required to register outbound customer webhook endpoints. Protect and back up both keys: losing either makes stored secrets undecryptable.
 4. For actual email delivery, configure `EMAIL_TRANSPORT`, `EMAIL_FROM`, and the corresponding provider credentials. `EMAIL_TRANSPORT=disabled` is the local default; queued email tasks will be marked failed rather than silently reported as delivered.
-5. For SendGrid, configure domain authentication in SendGrid as well as publishing the service's DNS records. SendGrid signs the HTTP-submitted message with its provider-managed key; the generated key is used for SMTP delivery. Set `SENDGRID_WEBHOOK_PUBLIC_KEY` to the Event Webhook verification key to enable signed bounce/complaint callbacks. Set `EMAIL_SPF_VALUE` to the SPF value appropriate for the selected delivery path.
+5. For SendGrid, configure domain authentication in SendGrid as well as publishing the service's DNS records. SendGrid signs the HTTP-submitted message with its provider-managed key; the generated key is used for SMTP delivery. Set `SENDGRID_WEBHOOK_PUBLIC_KEY` to the Event Webhook verification key to enable signed bounce/complaint callbacks. Each send includes a `message_id` custom arg, which SendGrid returns as a top-level event field. Set `EMAIL_SPF_VALUE` to the SPF value appropriate for the selected delivery path.
 6. To enable SMS, set `SMS_TRANSPORT` to `twilio` or `telnyx`, set `SMS_FROM` and `SMS_STATUS_CALLBACK_URL`, and provide the corresponding provider credentials. Twilio additionally needs `TWILIO_INBOUND_WEBHOOK_URL`; Telnyx needs `TELNYX_WEBHOOK_PUBLIC_KEY`. Configure both `SMS_COUNTRY_RATES_USD` and `SMS_COUNTRY_MONTHLY_CAPS_USD` as comma-separated `ISO=amount` pairs (for example, `US=0.01,GB=0.05`). Rates are estimated USD per SMS segment; budgets reserve that estimate for the current UTC month. The account send limit is a fixed per-minute window. Unconfigured destination countries fail closed.
 7. Configure the provider's inbound webhook to `/internal/webhooks/sms/twilio` or `/internal/webhooks/sms/telnyx`. Twilio status callbacks are generated from `SMS_STATUS_CALLBACK_URL`; set it to the matching public Twilio webhook endpoint. Telnyx delivery callbacks use that URL from each send request. Provider callback routes use provider signature verification and are separate from customer API-key routes.
 8. Before sending SMS, record the recipient's explicit consent:
@@ -90,7 +105,7 @@ Acceptance: a valid request receives `202` and a stable message ID; replaying th
      -ContentType "application/json" -Body $consent
    ```
 
-   Use `scope = "marketing"` for marketing permission or `scope = "all"` only when the captured consent explicitly covers both. `consented = false` withdraws consent and adds an SMS suppression. Inbound STOP, STOPALL, UNSUBSCRIBE, CANCEL, END, QUIT, and REVOKE commands withdraw all SMS scopes and queue a confirmation.
+   In `api_key` mode, send a bearer key with the `consents:write` scope. Use `scope = "marketing"` for marketing permission or `scope = "all"` only when the captured consent explicitly covers both. `consented = false` withdraws consent and adds an SMS suppression. Inbound STOP, STOPALL, UNSUBSCRIBE, CANCEL, END, QUIT, and REVOKE commands withdraw all SMS scopes and queue a confirmation. If the provider's own opt-out handling (for example Twilio Advanced Opt-Out) already replies and blocks the number, the service's confirmation is rejected permanently and not retried; disable one of the two confirmations to avoid a provider error.
 
 9. Configure channel preferences with `PUT /v1/preferences`:
 
@@ -104,9 +119,9 @@ Acceptance: a valid request receives `202` and a stable message ID; replaying th
      -ContentType "application/json" -Body $preference
    ```
 
-   Preferences are recipient- and channel-specific. They do not override suppression or consent checks. Use `routing.strategy = "preference"` in a notification to dispatch only through enabled requested channels. `explicit` (the default) fans out to the requested channels concurrently. `waterfall` tries requested channels in the supplied `routing.order`, falling back after a synchronous provider failure; it does not retry after a provider has accepted the message.
+   Preferences are recipient- and channel-specific. They do not override suppression or consent checks. Use `routing.strategy = "preference"` in a notification to dispatch only through enabled requested channels. `explicit` (the default) fans out to the requested channels concurrently. `waterfall` tries requested channels in the supplied `routing.order`, falling back after a synchronous provider failure; it does not retry after a provider has accepted the message. Channels a waterfall did not need are recorded as skipped, and the message is `delivered` once any channel delivers. Message status moves `accepted` → `processing` (provider attempt in progress or accepted, awaiting a receipt) → `delivered`, `partially_delivered`, or `failed`.
 
-10. Register an outbound customer webhook. A 32-byte signing secret is returned once; save it securely. The payload bytes are signed as HMAC-SHA256 over `timestamp + "." + raw_body`, with `X-Roote-Timestamp` and `X-Roote-Signature: sha256=<hex>` headers. Only HTTPS endpoints are accepted, redirects are not followed, and outbound connections to non-public IP addresses are blocked.
+10. Register an outbound customer webhook. A 32-byte signing secret is returned once; save it securely. The payload bytes are signed as HMAC-SHA256 over `timestamp + "." + raw_body`, with `X-Roote-Timestamp` and `X-Roote-Signature: sha256=<hex>` headers. Only HTTPS endpoints are accepted, redirects are not followed, and outbound connections to private, loopback, link-local, CGNAT, NAT64, documentation, and other special-purpose addresses are blocked.
 
    ```powershell
    $webhook = @{
@@ -169,7 +184,7 @@ docker compose run --rm --no-deps --entrypoint /app/admin api create-key `
   --expires-in 720h
 ```
 
-Scopes are `notifications:write`, `preferences:write`, `webhooks:write`, `domains:read`, `domains:write`, `ops:read`, `ops:write`, and `data:delete`. `*` grants every scope and cannot be combined with other scopes. Expiry is optional; when set, it must be no longer than ten years. Rotate keys by creating a replacement, deploying it to the client, verifying usage, then revoking the old key:
+Scopes are `notifications:write`, `preferences:write`, `consents:write`, `webhooks:write`, `domains:read`, `domains:write`, `ops:read`, `ops:write`, and `data:delete`. `*` grants every scope and cannot be combined with other scopes. Expiry is optional; when set, it must be no longer than ten years. Rotate keys by creating a replacement, deploying it to the client, verifying usage, then revoking the old key:
 
 ```powershell
 docker compose run --rm --no-deps --entrypoint /app/admin api revoke-key --id <key-uuid>
@@ -179,7 +194,7 @@ The API keys created by this CLI belong to the configured `ACCOUNT_ID`; account 
 
 ### Monitoring and queue recovery
 
-- `GET /metrics` on the API and the worker's internal `METRICS_PORT` expose Prometheus text metrics. API metrics include low-cardinality method/route/status counters and latency histograms; worker metrics count completed/failed tasks by fixed task type.
+- `GET /metrics` on the API (scope `ops:read` in `api_key` mode; configure the scraper with a bearer key) and the worker's internal `METRICS_PORT` (unauthenticated; keep it on a private network) expose Prometheus text metrics. API metrics include low-cardinality method/route/status counters and latency histograms; worker metrics count completed/failed tasks by fixed task type.
 - `/readyz` requires both PostgreSQL and Redis to respond. `/healthz` is a liveness check only.
 - `GET /v1/ops/summary` (scope `ops:read`) reports database delivery/webhook backlogs and Asynq queue depth, retry, and archive counts.
 - `GET /v1/ops/dead-letters?limit=50` lists archived tasks without returning payloads or provider error strings. `POST /v1/ops/dead-letters/{task-id}/retry` (scope `ops:write`) requeues one archived task and writes an audit event. Retry only after correcting the underlying provider/configuration issue; provider acceptance followed by a crash can cause a duplicate delivery.

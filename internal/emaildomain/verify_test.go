@@ -33,3 +33,19 @@ func TestVerifyRecords(t *testing.T) {
 		t.Fatal("VerifyRecords() accepted a different DKIM key")
 	}
 }
+
+func TestSPFIncludesMechanismsAllowsMergedRecords(t *testing.T) {
+	required := "v=spf1 include:sendgrid.net ~all"
+	for published, want := range map[string]bool{
+		"v=spf1 include:sendgrid.net ~all":                         true,
+		"v=spf1 include:_spf.google.com include:sendgrid.net -all": true,
+		"v=spf1 +include:sendgrid.net ?all":                        true,
+		"v=spf1 include:_spf.google.com -all":                      false,
+		"include:sendgrid.net ~all":                                false,
+		"v=spf1 include:sendgrid.network ~all":                     false,
+	} {
+		if got := spfIncludesMechanisms(published, required); got != want {
+			t.Errorf("spfIncludesMechanisms(%q) = %t, want %t", published, got, want)
+		}
+	}
+}

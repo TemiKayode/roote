@@ -10,6 +10,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/google/uuid"
 )
 
 type Config struct {
@@ -201,6 +203,9 @@ func Load() (Config, error) {
 	}
 	if cfg.AccountID == "" {
 		return Config{}, fmt.Errorf("ACCOUNT_ID is required")
+	}
+	if _, err := uuid.Parse(cfg.AccountID); err != nil {
+		return Config{}, fmt.Errorf("ACCOUNT_ID must be a valid UUID")
 	}
 	if cfg.AsynqQueue == "" {
 		return Config{}, fmt.Errorf("ASYNQ_QUEUE must not be empty")

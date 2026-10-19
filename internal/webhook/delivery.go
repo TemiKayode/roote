@@ -7,8 +7,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -60,6 +62,7 @@ func (s *Sender) Send(ctx context.Context, delivery store.WebhookDelivery) (int,
 		return 0, fmt.Errorf("send webhook request to %q failed (%T)", parsed.Hostname(), err)
 	}
 	defer response.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 64<<10))
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		return response.StatusCode, fmt.Errorf("webhook endpoint returned HTTP %d", response.StatusCode)
 	}
@@ -86,17 +89,51 @@ func safeDialContext(ctx context.Context, network, address string) (net.Conn, er
 		return nil, fmt.Errorf("resolve webhook destination: %w", err)
 	}
 	for _, candidate := range ips {
-		ip := candidate.IP
-		if ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() ||
-			ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
+		ip, ok := netip.AddrFromSlice(candidate.IP)
+		if !ok || !IsPublicAddress(ip) {
 			continue
 		}
 		conn, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(
-			ctx, network, net.JoinHostPort(ip.String(), port),
+			ctx, network, net.JoinHostPort(ip.Unmap().String(), port),
 		)
 		if err == nil {
 			return conn, nil
 		}
 	}
 	return nil, fmt.Errorf("webhook destination has no reachable public address")
+}
+
+// nonPublicPrefixes are special-purpose ranges (RFC 6890 and successors) that a customer
+// webhook must never reach, in addition to the private, loopback, link-local, multicast,
+// and unspecified ranges checked by IsPublicAddress.
+var nonPublicPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("198.51.100.0/24"),
+	netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+	netip.MustParsePrefix("64:ff9b::/96"),
+	netip.MustParsePrefix("64:ff9b:1::/48"),
+	netip.MustParsePrefix("100::/64"),
+	netip.MustParsePrefix("2001::/23"),
+	netip.MustParsePrefix("2001:db8::/32"),
+	netip.MustParsePrefix("2002::/16"),
+}
+
+// IsPublicAddress reports whether ip is a globally routable unicast address.
+func IsPublicAddress(ip netip.Addr) bool {
+	ip = ip.Unmap()
+	if !ip.IsValid() || !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() ||
+		ip.IsLinkLocalUnicast() || ip.IsMulticast() || ip.IsUnspecified() {
+		return false
+	}
+	for _, prefix := range nonPublicPrefixes {
+		if prefix.Contains(ip) {
+			return false
+		}
+	}
+	return true
 }

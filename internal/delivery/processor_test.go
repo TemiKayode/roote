@@ -3,12 +3,14 @@ package delivery
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"testing"
 
 	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/TemiKayode/roote/internal/config"
 	"github.com/TemiKayode/roote/internal/emaildomain"
@@ -42,6 +44,8 @@ type fakeRepository struct {
 	channelSkips          []string
 	failureWebhookCount   int
 	exhaustedRetries      int
+	loadErr               error
+	dkimErr               error
 }
 
 func (f *fakeRepository) GetDomain(context.Context, string, uuid.UUID) (store.Domain, error) {
@@ -51,6 +55,9 @@ func (f *fakeRepository) SetDomainVerificationResult(context.Context, uuid.UUID,
 	return errors.New("not implemented")
 }
 func (f *fakeRepository) GetEmailJob(context.Context, uuid.UUID) (store.EmailJob, error) {
+	if f.loadErr != nil {
+		return store.EmailJob{}, f.loadErr
+	}
 	if f.job.ID == uuid.Nil && f.smsJob.ID != uuid.Nil {
 		return store.EmailJob{}, errors.New("not an email job")
 	}
@@ -60,7 +67,7 @@ func (f *fakeRepository) GetEmailJob(context.Context, uuid.UUID) (store.EmailJob
 	return f.job, nil
 }
 func (f *fakeRepository) GetDKIMKey(context.Context, uuid.UUID, string) (store.DKIMKey, error) {
-	return f.dkimKey, nil
+	return f.dkimKey, f.dkimErr
 }
 func (f *fakeRepository) IsEmailSuppressed(context.Context, uuid.UUID, string) (bool, error) {
 	return f.suppressed, nil
@@ -84,6 +91,9 @@ func (f *fakeRepository) FailEmailDelivery(context.Context, uuid.UUID, error) er
 	return nil
 }
 func (f *fakeRepository) GetSMSJob(context.Context, uuid.UUID) (store.SMSJob, error) {
+	if f.loadErr != nil {
+		return store.SMSJob{}, f.loadErr
+	}
 	return f.smsJob, nil
 }
 func (f *fakeRepository) IsSMSSuppressed(context.Context, uuid.UUID, string) (bool, error) {
@@ -457,6 +467,73 @@ func TestWaterfallRoutingFallsBackAfterEmailFailure(t *testing.T) {
 	if repository.beginCount != 1 || repository.smsSendCount != 1 || repository.smsComplete != 1 {
 		t.Fatalf("waterfall attempts: email=%d SMS=%d completed=%d",
 			repository.beginCount, repository.smsSendCount, repository.smsComplete)
+	}
+}
+
+func TestWaterfallRoutingSkipsRemainingChannelsAfterSuccess(t *testing.T) {
+	messageID, accountID := uuid.New(), uuid.New()
+	material, err := emaildomain.GenerateKeyMaterial()
+	if err != nil {
+		t.Fatal(err)
+	}
+	encryptionKey := make([]byte, 32)
+	ciphertext, err := emaildomain.EncryptPrivateKey(encryptionKey, material.PrivatePEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routing := store.Routing{Strategy: "waterfall", Order: []string{"email", "sms"}}
+	repository := &fakeRepository{
+		job: store.EmailJob{
+			ID: messageID, AccountID: accountID, Channels: []string{"email", "sms"},
+			Recipient: "person@example.net", Subject: "Hello", Body: "World", Routing: routing,
+		},
+		dkimKey: store.DKIMKey{Selector: material.Selector, EncryptedPrivateKey: ciphertext},
+		smsJob: store.SMSJob{
+			ID: messageID, AccountID: accountID, Channels: []string{"email", "sms"},
+			Recipient: "+14155552671", Body: "Hello", Routing: routing,
+		},
+		smsConsent: true,
+	}
+	processor := NewProcessor(
+		repository, &fakeTransport{}, &fakeSMSTransport{},
+		config.Config{EmailFrom: "notifications@example.org", DKIMEncryptionKey: encryptionKey},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	if err := processor.DeliverNotification(context.Background(), messageID); err != nil {
+		t.Fatal(err)
+	}
+	if repository.completeCount != 1 || repository.smsSendCount != 0 ||
+		len(repository.channelSkips) != 1 || repository.channelSkips[0] != "sms" {
+		t.Fatalf("waterfall success: email=%d SMS=%d skips=%v",
+			repository.completeCount, repository.smsSendCount, repository.channelSkips)
+	}
+}
+
+func TestDeletedNotificationIsNotRetried(t *testing.T) {
+	repository := &fakeRepository{loadErr: fmt.Errorf("load message: %w", pgx.ErrNoRows)}
+	processor := NewProcessor(repository, nil, nil, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := processor.DeliverNotification(context.Background(), uuid.New()); !errors.Is(err, asynq.SkipRetry) {
+		t.Fatalf("deleted notification error = %v, want SkipRetry", err)
+	}
+}
+
+func TestTransientDKIMLookupErrorIsRetried(t *testing.T) {
+	messageID := uuid.New()
+	repository := &fakeRepository{
+		job: store.EmailJob{
+			ID: messageID, AccountID: uuid.New(), Channels: []string{"email"},
+			Recipient: "person@example.net", Subject: "Hello", Body: "World",
+		},
+		dkimErr: errors.New("connection reset"),
+	}
+	processor := NewProcessor(
+		repository, &fakeTransport{}, nil,
+		config.Config{EmailFrom: "notifications@example.org", DKIMEncryptionKey: make([]byte, 32)},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	err := processor.DeliverNotification(context.Background(), messageID)
+	if err == nil || errors.Is(err, asynq.SkipRetry) || len(repository.channelFailures) != 0 {
+		t.Fatalf("transient DKIM error = %v failures=%v, want retryable error", err, repository.channelFailures)
 	}
 }
 

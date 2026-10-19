@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/mail"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"slices"
@@ -31,6 +32,7 @@ import (
 	securesecret "github.com/TemiKayode/roote/internal/secret"
 	"github.com/TemiKayode/roote/internal/smswebhook"
 	"github.com/TemiKayode/roote/internal/store"
+	"github.com/TemiKayode/roote/internal/webhook"
 )
 
 var (
@@ -236,7 +238,7 @@ func newRouter(
 	router.Use(gin.Recovery())
 	router.GET("/healthz", server.health)
 	router.GET("/readyz", server.ready)
-	router.GET("/metrics", gin.WrapH(observability.MetricsHandler(runtime.Metrics)))
+	router.GET("/metrics", server.requireScope("ops:read"), gin.WrapH(observability.MetricsHandler(runtime.Metrics)))
 	router.POST("/v1/notifications", server.requireScope("notifications:write"), server.createNotification)
 	router.PUT("/v1/preferences", server.requireScope("preferences:write"), server.setNotificationPreference)
 	router.POST("/v1/webhooks", server.requireScope("webhooks:write"), server.createCustomerWebhook)
@@ -249,7 +251,7 @@ func newRouter(
 	router.POST("/v1/ops/dead-letters/:id/retry", server.requireScope("ops:write"), server.retryDeadLetter)
 	router.DELETE("/v1/messages/:id", server.requireScope("data:delete"), server.deleteMessage)
 	router.POST("/internal/webhooks/email", server.sendGridWebhook)
-	router.POST("/v1/consents/sms", server.recordSMSConsent)
+	router.POST("/v1/consents/sms", server.requireScope("consents:write"), server.recordSMSConsent)
 	router.POST("/internal/webhooks/sms/twilio", server.twilioSMSWebhook)
 	router.POST("/internal/webhooks/sms/telnyx", server.telnyxSMSWebhook)
 	return router
@@ -704,8 +706,7 @@ func (s *Server) createCustomerWebhook(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "url must be an absolute HTTPS URL"})
 		return
 	}
-	if ip := net.ParseIP(parsedURL.Hostname()); ip != nil &&
-		(ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() || ip.IsMulticast()) {
+	if ip, err := netip.ParseAddr(parsedURL.Hostname()); err == nil && !webhook.IsPublicAddress(ip) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "url must target a public HTTPS host"})
 		return
 	}
@@ -925,13 +926,15 @@ func (s *Server) verifyDomain(c *gin.Context) {
 	c.JSON(http.StatusAccepted, gin.H{"domain_id": domainID.String(), "verification_status": "pending"})
 }
 
+// sendGridEvent is one Event Webhook entry. SendGrid returns Mail Send custom_args as
+// top-level event properties, so message_id arrives next to event and email.
 type sendGridEvent struct {
-	Event      string            `json:"event"`
-	Type       string            `json:"type"`
-	Status     string            `json:"status"`
-	Email      string            `json:"email"`
-	EventID    string            `json:"sg_event_id"`
-	CustomArgs map[string]string `json:"custom_args"`
+	Event     string `json:"event"`
+	Type      string `json:"type"`
+	Status    string `json:"status"`
+	Email     string `json:"email"`
+	EventID   string `json:"sg_event_id"`
+	MessageID string `json:"message_id"`
 }
 
 func (s *Server) sendGridWebhook(c *gin.Context) {
@@ -972,10 +975,14 @@ func (s *Server) sendGridWebhook(c *gin.Context) {
 		default:
 			continue
 		}
-		messageID, err := uuid.Parse(event.CustomArgs["message_id"])
+		// A signed batch can include events for mail sent outside this service or for messages
+		// already deleted. Skip those individually: rejecting the batch would make SendGrid
+		// retry it and drop the valid events alongside them.
+		messageID, err := uuid.Parse(event.MessageID)
 		if err != nil || event.EventID == "" || event.Email == "" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "bounce and complaint events require message_id, sg_event_id, and email"})
-			return
+			s.logger.WarnContext(c.Request.Context(), "skipping SendGrid event without message_id, sg_event_id, or email",
+				"event", event.Event)
+			continue
 		}
 		applied, err := s.domainStore.ProcessEmailWebhookEvent(c.Request.Context(), store.EmailWebhookEvent{
 			ProviderEventID: event.EventID,
@@ -983,6 +990,11 @@ func (s *Server) sendGridWebhook(c *gin.Context) {
 			Recipient:       event.Email,
 			EventType:       eventType,
 		})
+		if errors.Is(err, pgx.ErrNoRows) || errors.Is(err, store.ErrWebhookMismatch) {
+			s.logger.WarnContext(c.Request.Context(), "skipping SendGrid event for an unknown or mismatched message",
+				"message_id", messageID, "error", err)
+			continue
+		}
 		if err != nil {
 			s.logger.ErrorContext(c.Request.Context(), "could not process SendGrid email event", "error", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "could not process email webhook"})
@@ -1068,6 +1080,12 @@ func (s *Server) processTwilioSMSStatus(c *gin.Context, values url.Values) {
 		Recipient:         recipient,
 		EventType:         eventType,
 	})
+	if errors.Is(err, pgx.ErrNoRows) || errors.Is(err, store.ErrWebhookMismatch) {
+		s.logger.WarnContext(c.Request.Context(), "ignoring Twilio SMS status for an unknown or mismatched message",
+			"message_id", messageID, "error", err)
+		c.JSON(http.StatusOK, gin.H{"processed": 0})
+		return
+	}
 	if err != nil {
 		s.logger.ErrorContext(c.Request.Context(), "could not process Twilio SMS status", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not process SMS status"})
@@ -1175,6 +1193,12 @@ func (s *Server) processTelnyxSMSStatus(c *gin.Context, eventID, eventType strin
 		Recipient:         recipient,
 		EventType:         eventStatus,
 	})
+	if errors.Is(err, pgx.ErrNoRows) || errors.Is(err, store.ErrWebhookMismatch) {
+		s.logger.WarnContext(c.Request.Context(), "ignoring Telnyx SMS status for an unknown or mismatched message",
+			"message_id", messageID, "error", err)
+		c.JSON(http.StatusOK, gin.H{"processed": 0})
+		return
+	}
 	if err != nil {
 		s.logger.ErrorContext(c.Request.Context(), "could not process Telnyx SMS status", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not process SMS status"})

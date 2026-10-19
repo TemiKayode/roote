@@ -21,6 +21,7 @@ import (
 var validScopes = map[string]struct{}{
 	"notifications:write": {},
 	"preferences:write":   {},
+	"consents:write":      {},
 	"webhooks:write":      {},
 	"domains:read":        {},
 	"domains:write":       {},

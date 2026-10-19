@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/emersion/go-msgauth/dkim"
 	"github.com/TemiKayode/roote/internal/emaildomain"
+	"github.com/emersion/go-msgauth/dkim"
 )
 
 func TestComposeAndSignAddsDKIMAndMarketingHeaders(t *testing.T) {
