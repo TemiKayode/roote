@@ -89,6 +89,7 @@ func run() error {
 			AuditStore: database,
 			Inspector:  inspector,
 			QueueNames: queue.QueueNames(cfg.AsynqQueue),
+			Reads:      database,
 			ReadyCheck: func(ctx context.Context) error {
 				return redisClient.Ping(ctx).Err()
 			},

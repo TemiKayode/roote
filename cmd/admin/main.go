@@ -14,22 +14,18 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/TemiKayode/roote/internal/apiscope"
 	"github.com/TemiKayode/roote/internal/config"
 	"github.com/TemiKayode/roote/internal/store"
 )
 
-var validScopes = map[string]struct{}{
-	"notifications:write": {},
-	"preferences:write":   {},
-	"consents:write":      {},
-	"webhooks:write":      {},
-	"domains:read":        {},
-	"domains:write":       {},
-	"ops:read":            {},
-	"ops:write":           {},
-	"data:delete":         {},
-	"*":                   {},
-}
+var validScopes = func() map[string]struct{} {
+	scopes := make(map[string]struct{}, len(apiscope.Valid))
+	for _, scope := range apiscope.Valid {
+		scopes[scope] = struct{}{}
+	}
+	return scopes
+}()
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -142,7 +138,7 @@ func parseScopes(value string) ([]string, error) {
 		scopes = append(scopes, scope)
 	}
 	if len(scopes) > 1 {
-		if _, wildcard := seen["*"]; wildcard {
+		if _, wildcard := seen[apiscope.All]; wildcard {
 			return nil, errors.New("wildcard scope cannot be combined with other scopes")
 		}
 	}

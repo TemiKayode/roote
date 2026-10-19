@@ -27,6 +27,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/nyaruka/phonenumbers"
 
+	"github.com/TemiKayode/roote/internal/apiscope"
 	"github.com/TemiKayode/roote/internal/emaildomain"
 	"github.com/TemiKayode/roote/internal/observability"
 	securesecret "github.com/TemiKayode/roote/internal/secret"
@@ -96,6 +97,7 @@ type RuntimeFeatures struct {
 	Metrics    *observability.Metrics
 	Inspector  *asynq.Inspector
 	QueueNames []string
+	Reads      ReadStore
 }
 
 type EmailFeatures struct {
@@ -147,6 +149,7 @@ type Server struct {
 	metrics                    *observability.Metrics
 	inspector                  *asynq.Inspector
 	queueNames                 []string
+	reads                      ReadStore
 }
 
 func New(logger *slog.Logger, accountID string, notificationStore NotificationStore) *gin.Engine {
@@ -233,26 +236,36 @@ func newRouter(
 		metrics:                    runtime.Metrics,
 		inspector:                  runtime.Inspector,
 		queueNames:                 runtime.QueueNames,
+		reads:                      runtime.Reads,
 	}
 	router := gin.New()
 	router.Use(observability.Middleware(runtime.Metrics, logger))
 	router.Use(gin.Recovery())
 	router.GET("/healthz", server.health)
 	router.GET("/readyz", server.ready)
-	router.GET("/metrics", server.requireScope("ops:read"), gin.WrapH(observability.MetricsHandler(runtime.Metrics)))
-	router.POST("/v1/notifications", server.requireScope("notifications:write"), server.createNotification)
-	router.PUT("/v1/preferences", server.requireScope("preferences:write"), server.setNotificationPreference)
-	router.POST("/v1/webhooks", server.requireScope("webhooks:write"), server.createCustomerWebhook)
-	router.POST("/v1/domains", server.requireScope("domains:write"), server.createDomain)
-	router.POST("/v1/domains/:id/verify", server.requireScope("domains:write"), server.verifyDomain)
-	router.GET("/v1/domains/:id/records", server.requireScope("domains:read"), server.domainRecords)
-	router.PUT("/v1/ops/capacities", server.requireScope("ops:write"), server.setCapacity)
-	router.GET("/v1/ops/summary", server.requireScope("ops:read"), server.operationalSummary)
-	router.GET("/v1/ops/dead-letters", server.requireScope("ops:read"), server.listDeadLetters)
-	router.POST("/v1/ops/dead-letters/:id/retry", server.requireScope("ops:write"), server.retryDeadLetter)
-	router.DELETE("/v1/messages/:id", server.requireScope("data:delete"), server.deleteMessage)
+	router.GET("/metrics", server.requireScope(apiscope.OpsRead), gin.WrapH(observability.MetricsHandler(runtime.Metrics)))
+	router.POST("/v1/notifications", server.requireScope(apiscope.NotificationsWrite), server.createNotification)
+	router.GET("/v1/messages", server.requireScope(apiscope.MessagesRead), server.listMessages)
+	router.GET("/v1/messages/:id", server.requireScope(apiscope.MessagesRead), server.getMessage)
+	router.DELETE("/v1/messages/:id", server.requireScope(apiscope.DataDelete), server.deleteMessage)
+	router.PUT("/v1/preferences", server.requireScope(apiscope.PreferencesWrite), server.setNotificationPreference)
+	router.GET("/v1/webhooks", server.requireScope(apiscope.WebhooksRead), server.listCustomerWebhooks)
+	router.POST("/v1/webhooks", server.requireScope(apiscope.WebhooksWrite), server.createCustomerWebhook)
+	router.DELETE("/v1/webhooks/:id", server.requireScope(apiscope.WebhooksWrite), server.deactivateCustomerWebhook)
+	router.POST("/v1/webhooks/:id/rotate-secret", server.requireScope(apiscope.WebhooksWrite), server.rotateCustomerWebhookSecret)
+	router.GET("/v1/domains", server.requireScope(apiscope.DomainsRead), server.listDomains)
+	router.POST("/v1/domains", server.requireScope(apiscope.DomainsWrite), server.createDomain)
+	router.POST("/v1/domains/:id/verify", server.requireScope(apiscope.DomainsWrite), server.verifyDomain)
+	router.GET("/v1/domains/:id/records", server.requireScope(apiscope.DomainsRead), server.domainRecords)
+	router.GET("/v1/suppressions", server.requireScope(apiscope.SuppressionsRead), server.listSuppressions)
+	router.DELETE("/v1/suppressions", server.requireScope(apiscope.SuppressionsWrite), server.deleteSuppression)
+	router.GET("/v1/consents/sms", server.requireScope(apiscope.ConsentsRead), server.listSMSConsents)
+	router.POST("/v1/consents/sms", server.requireScope(apiscope.ConsentsWrite), server.recordSMSConsent)
+	router.PUT("/v1/ops/capacities", server.requireScope(apiscope.OpsWrite), server.setCapacity)
+	router.GET("/v1/ops/summary", server.requireScope(apiscope.OpsRead), server.operationalSummary)
+	router.GET("/v1/ops/dead-letters", server.requireScope(apiscope.OpsRead), server.listDeadLetters)
+	router.POST("/v1/ops/dead-letters/:id/retry", server.requireScope(apiscope.OpsWrite), server.retryDeadLetter)
 	router.POST("/internal/webhooks/email", server.sendGridWebhook)
-	router.POST("/v1/consents/sms", server.requireScope("consents:write"), server.recordSMSConsent)
 	router.POST("/internal/webhooks/sms/twilio", server.twilioSMSWebhook)
 	router.POST("/internal/webhooks/sms/telnyx", server.telnyxSMSWebhook)
 	return router
@@ -322,7 +335,7 @@ func (s *Server) requireScope(scope string) gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		if !slices.Contains(key.Scopes, scope) && !slices.Contains(key.Scopes, "*") {
+		if !slices.Contains(key.Scopes, scope) && !slices.Contains(key.Scopes, apiscope.All) {
 			c.JSON(http.StatusForbidden, gin.H{"error": "API key does not have the required scope"})
 			c.Abort()
 			return

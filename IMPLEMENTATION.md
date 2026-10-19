@@ -83,6 +83,30 @@ Verified on 2026-10-19: all store integration tests pass against PostgreSQL 17 w
 - SPF verification checks that each required mechanism is present, so records merged with other providers or using `-all` verify.
 - `ACCOUNT_ID` must be a UUID at startup. Migration 6 backfills `webhook_deliveries.source_message_id` so retention and deletion cascade to pre-M5 webhook rows, and indexes case-insensitive suppression and preference lookups.
 
+### Roadmap progress (2026-10-19)
+
+Phase 1 item 1 (read APIs) and the two small Phase 2 items are complete; see the product roadmap for what follows.
+
+| Endpoint | Scope | Purpose |
+| --- | --- | --- |
+| `GET /v1/messages/{id}` | `messages:read` | Message status, recipient, routing, per-channel deliveries, attempts, and event timeline. Message content is not returned. |
+| `GET /v1/messages?status=&recipient=&since=&until=&limit=&cursor=` | `messages:read` | Newest-first search; `recipient` is an email address or E.164 number, `since`/`until` are RFC 3339, `limit` is 1–200 (default 50); pass `next_cursor` back as `cursor`. |
+| `GET /v1/webhooks` | `webhooks:read` | List endpoints, active and inactive. |
+| `DELETE /v1/webhooks/{id}` | `webhooks:write` | Deactivate an endpoint; its pending deliveries are marked failed. |
+| `POST /v1/webhooks/{id}/rotate-secret` | `webhooks:write` | Replace the signing secret; the new secret is returned once and the old one stops working immediately. |
+| `GET /v1/domains` | `domains:read` | List sending domains with verification status and last error. |
+| `GET /v1/suppressions?channel=&recipient=&limit=&cursor=` | `suppressions:read` | List suppressions, newest first. |
+| `DELETE /v1/suppressions?channel=email&recipient=` | `suppressions:write` | Remove a hard-bounce suppression. Complaints (`409`) and SMS opt-outs (`400`) cannot be removed through the API; SMS opt-outs clear only with new consent. |
+| `GET /v1/consents/sms?phone=` | `consents:read` | Consent history for a number, newest first. |
+
+- **Queue isolation.** Work runs on weighted Asynq queues named `<ASYNQ_QUEUE>-transactional` (weight 6), `-webhooks` (2), `-marketing` (2), and `-system` (1, domain verification). Marketing notifications use the marketing queue; transactional notifications and STOP confirmations use the transactional queue. The worker also drains the bare `ASYNQ_QUEUE` so tasks enqueued before this change finish.
+- **Batched outbox relay.** The notification and webhook relays move up to 100 rows per transaction and wake on PostgreSQL `LISTEN/NOTIFY` when work is committed, with a 5-second poll as a fallback.
+- **Audited acceptance.** The `notification.accepted` audit event is written in the same transaction as the message.
+- **Domain re-verification.** A verified domain stays `verified` while it is re-checked, so sending is not interrupted. A domain becomes `failed` only after its DNS verification retries are exhausted.
+- **Rate-window cleanup.** The daily retention job deletes SMS rate-limit windows older than one day.
+- **Breaking change:** `GET /v1/ops/summary` now returns a `queues` array (one entry per queue that has received work) instead of a single `queue` object, and dead-letter entries include their `queue`.
+- Migration 7 adds indexes for message search and suppression listing.
+
 ## Build steps
 
 1. Install Go 1.24+ and Docker Desktop with Compose.
@@ -184,7 +208,7 @@ docker compose run --rm --no-deps --entrypoint /app/admin api create-key `
   --expires-in 720h
 ```
 
-Scopes are `notifications:write`, `preferences:write`, `consents:write`, `webhooks:write`, `domains:read`, `domains:write`, `ops:read`, `ops:write`, and `data:delete`. `*` grants every scope and cannot be combined with other scopes. Expiry is optional; when set, it must be no longer than ten years. Rotate keys by creating a replacement, deploying it to the client, verifying usage, then revoking the old key:
+Scopes are `notifications:write`, `messages:read`, `preferences:write`, `consents:read`, `consents:write`, `webhooks:read`, `webhooks:write`, `domains:read`, `domains:write`, `suppressions:read`, `suppressions:write`, `ops:read`, `ops:write`, and `data:delete`. `*` grants every scope and cannot be combined with other scopes. Expiry is optional; when set, it must be no longer than ten years. Rotate keys by creating a replacement, deploying it to the client, verifying usage, then revoking the old key:
 
 ```powershell
 docker compose run --rm --no-deps --entrypoint /app/admin api revoke-key --id <key-uuid>
@@ -196,8 +220,8 @@ The API keys created by this CLI belong to the configured `ACCOUNT_ID`; account 
 
 - `GET /metrics` on the API (scope `ops:read` in `api_key` mode; configure the scraper with a bearer key) and the worker's internal `METRICS_PORT` (unauthenticated; keep it on a private network) expose Prometheus text metrics. API metrics include low-cardinality method/route/status counters and latency histograms; worker metrics count completed/failed tasks by fixed task type.
 - `/readyz` requires both PostgreSQL and Redis to respond. `/healthz` is a liveness check only.
-- `GET /v1/ops/summary` (scope `ops:read`) reports database delivery/webhook backlogs and Asynq queue depth, retry, and archive counts.
-- `GET /v1/ops/dead-letters?limit=50` lists archived tasks without returning payloads or provider error strings. `POST /v1/ops/dead-letters/{task-id}/retry` (scope `ops:write`) requeues one archived task and writes an audit event. Retry only after correcting the underlying provider/configuration issue; provider acceptance followed by a crash can cause a duplicate delivery.
+- `GET /v1/ops/summary` (scope `ops:read`) reports database delivery/webhook backlogs and, per Asynq queue, depth, retry, and archive counts.
+- `GET /v1/ops/dead-letters?limit=50` lists archived tasks across all queues, with each task's queue, without returning payloads or provider error strings. `POST /v1/ops/dead-letters/{task-id}/retry` (scope `ops:write`) requeues one archived task and writes an audit event. Retry only after correcting the underlying provider/configuration issue; provider acceptance followed by a crash can cause a duplicate delivery.
 - Notification retries exhausted by Asynq are persisted as failed or partially delivered and emit the normal terminal customer notification event. Webhook tasks have their own durable delivery status and bounded retries. Investigate archived domain-verification tasks before manually retrying them.
 - Outbox writes are durable in PostgreSQL; if Redis is unavailable, readiness fails and the worker relay retries later. Do not purge Redis to recover an outage. Inspect the queue summary and application logs, restore Redis connectivity, then retry only archived work that is safe to repeat.
 
