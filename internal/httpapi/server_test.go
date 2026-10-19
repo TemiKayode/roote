@@ -32,6 +32,7 @@ type fakeStore struct {
 	hash    [32]byte
 	created bool
 	calls   int
+	payload []byte
 }
 
 type fakeMilestoneFourStore struct {
@@ -104,11 +105,16 @@ func (f *fakeStore) AcceptAuditedNotification(
 	_ context.Context,
 	_, _ string,
 	_ store.Notification,
-	request []byte,
+	payload []byte,
+	requestHash []byte,
 	_ *store.AuditEvent,
 ) (uuid.UUID, bool, error) {
 	f.calls++
-	hash := sha256.Sum256(request)
+	f.payload = payload
+	hash := sha256.Sum256(payload)
+	if requestHash != nil {
+		copy(hash[:], requestHash)
+	}
 	if f.created {
 		if f.hash != hash {
 			return uuid.Nil, false, store.ErrIdempotencyConflict

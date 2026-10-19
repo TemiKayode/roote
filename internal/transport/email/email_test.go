@@ -145,3 +145,59 @@ func TestSendGridTransportClassifiesRetryableResponses(t *testing.T) {
 		})
 	}
 }
+
+func TestComposeAndSignIncludesHTMLAlternative(t *testing.T) {
+	key, err := emaildomain.GenerateKeyMaterial()
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, err := NewMessage(
+		"id-2", "alerts@example.org", "person@example.net", "Receipt", "Plain body",
+		"transactional", "", key.Selector, key.PrivatePEM,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message.HTML = "<p>HTML body</p>"
+	raw, err := composeAndSign(message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{"multipart/alternative", "text/plain", "text/html", "Plain body", "HTML body"} {
+		if !strings.Contains(string(raw), expected) {
+			t.Fatalf("signed message missing %q: %s", expected, raw)
+		}
+	}
+	verifications, err := dkim.VerifyWithOptions(strings.NewReader(string(raw)), &dkim.VerifyOptions{
+		LookupTXT: func(string) ([]string, error) {
+			return []string{"v=DKIM1; k=rsa; p=" + key.PublicKey}, nil
+		},
+	})
+	if err != nil || len(verifications) != 1 || verifications[0].Err != nil {
+		t.Fatalf("DKIM verification = %+v, error = %v", verifications, err)
+	}
+}
+
+func TestSendGridTransportSendsHTMLAfterText(t *testing.T) {
+	var received sendGridRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&received)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+	transport, err := NewSendGridTransport("test-api-key", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport.endpoint = server.URL
+	if _, err := transport.Send(context.Background(), Message{
+		ID: "id", From: "alerts@example.org", To: "person@example.net",
+		Subject: "Hi", Body: "Plain", HTML: "<p>Rich</p>",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(received.Content) != 2 || received.Content[0].Type != "text/plain" ||
+		received.Content[1].Type != "text/html" || received.Content[1].Value != "<p>Rich</p>" {
+		t.Fatalf("SendGrid content = %+v", received.Content)
+	}
+}

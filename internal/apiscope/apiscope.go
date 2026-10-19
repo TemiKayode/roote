@@ -13,6 +13,8 @@ const (
 	DomainsWrite       = "domains:write"
 	SuppressionsRead   = "suppressions:read"
 	SuppressionsWrite  = "suppressions:write"
+	TemplatesRead      = "templates:read"
+	TemplatesWrite     = "templates:write"
 	OpsRead            = "ops:read"
 	OpsWrite           = "ops:write"
 	DataDelete         = "data:delete"
@@ -24,5 +26,6 @@ const (
 var Valid = []string{
 	NotificationsWrite, MessagesRead, PreferencesWrite, ConsentsRead, ConsentsWrite,
 	WebhooksRead, WebhooksWrite, DomainsRead, DomainsWrite, SuppressionsRead, SuppressionsWrite,
+	TemplatesRead, TemplatesWrite,
 	OpsRead, OpsWrite, DataDelete, All,
 }

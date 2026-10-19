@@ -107,6 +107,21 @@ Phase 1 item 1 (read APIs) and the two small Phase 2 items are complete; see the
 - **Breaking change:** `GET /v1/ops/summary` now returns a `queues` array (one entry per queue that has received work) instead of a single `queue` object, and dead-letter entries include their `queue`.
 - Migration 7 adds indexes for message search and suppression listing.
 
+**Templates (Phase 1 item 2).** Templates are versioned; each version is immutable and holds content per locale: `email_subject`, `email_text`, optional `email_html`, and `sms_text`. Publishing a version makes it the one sent when a notification names no version.
+
+| Endpoint | Scope | Purpose |
+| --- | --- | --- |
+| `POST /v1/templates` `{"key","name"}` | `templates:write` | Register a template key (lowercase letters, digits, `.`, `_`, `-`). |
+| `GET /v1/templates`, `GET /v1/templates/{key}` | `templates:read` | List templates; show one with its version history and active version. |
+| `POST /v1/templates/{key}/versions` `{"default_locale","contents":{"en":{...}}}` | `templates:write` | Create the next version. Syntax is checked on create. |
+| `GET /v1/templates/{key}/versions/{n}` | `templates:read` | Show a version's contents. |
+| `POST /v1/templates/{key}/versions/{n}/publish` | `templates:write` | Make version `n` active. |
+| `POST /v1/templates/{key}/preview` `{"version","locale","channels","data"}` | `templates:read` | Render without sending. |
+
+A notification sends `"template": {"key", "version"?, "locale"?, "data"}` instead of `content`; sending both is a `400`. The API renders it when the request is accepted: a missing variable, an unpublished template, or a rendered subject with a line break returns `422` and nothing is queued. Locales fall back from `fr-CA` to `fr` to the version's default locale. HTML is rendered with automatic escaping; subjects, plain text, and SMS are not HTML-escaped. The stored message keeps the rendered content plus the template key, version, and locale actually used; template `data` is not stored. The idempotency hash covers the request as sent, so replaying a request after a new version is published returns the original message instead of `409`.
+
+Direct sends can also include `content.html` (up to 500 KB) for an HTML email part and `content.sms` (up to 1,600 bytes) to send different text over SMS than `content.body`. Email is sent as `multipart/alternative` with the plain-text part first; SMTP messages are DKIM-signed over the whole message. Migration 8 adds the template tables.
+
 ## Build steps
 
 1. Install Go 1.24+ and Docker Desktop with Compose.
@@ -208,7 +223,7 @@ docker compose run --rm --no-deps --entrypoint /app/admin api create-key `
   --expires-in 720h
 ```
 
-Scopes are `notifications:write`, `messages:read`, `preferences:write`, `consents:read`, `consents:write`, `webhooks:read`, `webhooks:write`, `domains:read`, `domains:write`, `suppressions:read`, `suppressions:write`, `ops:read`, `ops:write`, and `data:delete`. `*` grants every scope and cannot be combined with other scopes. Expiry is optional; when set, it must be no longer than ten years. Rotate keys by creating a replacement, deploying it to the client, verifying usage, then revoking the old key:
+Scopes are `notifications:write`, `messages:read`, `preferences:write`, `consents:read`, `consents:write`, `webhooks:read`, `webhooks:write`, `domains:read`, `domains:write`, `suppressions:read`, `suppressions:write`, `templates:read`, `templates:write`, `ops:read`, `ops:write`, and `data:delete`. `*` grants every scope and cannot be combined with other scopes. Expiry is optional; when set, it must be no longer than ten years. Rotate keys by creating a replacement, deploying it to the client, verifying usage, then revoking the old key:
 
 ```powershell
 docker compose run --rm --no-deps --entrypoint /app/admin api revoke-key --id <key-uuid>

@@ -123,12 +123,12 @@ func TestAuditedAcceptWritesAuditInSameTransaction(t *testing.T) {
 	notification.Content.Body = "Audited body"
 	payload, _ := json.Marshal(notification)
 	audit := &AuditEvent{AccountID: accountID, Action: "notification.accepted", Resource: "message"}
-	messageID, _, err := repository.AcceptAuditedNotification(ctx, accountID.String(), "audited", notification, payload, audit)
+	messageID, _, err := repository.AcceptAuditedNotification(ctx, accountID.String(), "audited", notification, payload, nil, audit)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, duplicate, err := repository.AcceptAuditedNotification(
-		ctx, accountID.String(), "audited", notification, payload, audit,
+		ctx, accountID.String(), "audited", notification, payload, nil, audit,
 	); err != nil || !duplicate {
 		t.Fatalf("replay duplicate=%t error=%v", duplicate, err)
 	}

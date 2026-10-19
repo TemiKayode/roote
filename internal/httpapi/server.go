@@ -30,6 +30,7 @@ import (
 	"github.com/TemiKayode/roote/internal/apiscope"
 	"github.com/TemiKayode/roote/internal/emaildomain"
 	"github.com/TemiKayode/roote/internal/observability"
+	"github.com/TemiKayode/roote/internal/rendering"
 	securesecret "github.com/TemiKayode/roote/internal/secret"
 	"github.com/TemiKayode/roote/internal/smswebhook"
 	"github.com/TemiKayode/roote/internal/store"
@@ -47,6 +48,7 @@ type NotificationStore interface {
 		string,
 		string,
 		store.Notification,
+		[]byte,
 		[]byte,
 		*store.AuditEvent,
 	) (uuid.UUID, bool, error)
@@ -98,6 +100,7 @@ type RuntimeFeatures struct {
 	Inspector  *asynq.Inspector
 	QueueNames []string
 	Reads      ReadStore
+	Templates  TemplateStore
 }
 
 type EmailFeatures struct {
@@ -150,6 +153,7 @@ type Server struct {
 	inspector                  *asynq.Inspector
 	queueNames                 []string
 	reads                      ReadStore
+	templates                  TemplateStore
 }
 
 func New(logger *slog.Logger, accountID string, notificationStore NotificationStore) *gin.Engine {
@@ -237,6 +241,7 @@ func newRouter(
 		inspector:                  runtime.Inspector,
 		queueNames:                 runtime.QueueNames,
 		reads:                      runtime.Reads,
+		templates:                  runtime.Templates,
 	}
 	router := gin.New()
 	router.Use(observability.Middleware(runtime.Metrics, logger))
@@ -253,6 +258,13 @@ func newRouter(
 	router.POST("/v1/webhooks", server.requireScope(apiscope.WebhooksWrite), server.createCustomerWebhook)
 	router.DELETE("/v1/webhooks/:id", server.requireScope(apiscope.WebhooksWrite), server.deactivateCustomerWebhook)
 	router.POST("/v1/webhooks/:id/rotate-secret", server.requireScope(apiscope.WebhooksWrite), server.rotateCustomerWebhookSecret)
+	router.GET("/v1/templates", server.requireScope(apiscope.TemplatesRead), server.listTemplates)
+	router.POST("/v1/templates", server.requireScope(apiscope.TemplatesWrite), server.createTemplate)
+	router.GET("/v1/templates/:key", server.requireScope(apiscope.TemplatesRead), server.getTemplate)
+	router.POST("/v1/templates/:key/versions", server.requireScope(apiscope.TemplatesWrite), server.createTemplateVersion)
+	router.GET("/v1/templates/:key/versions/:version", server.requireScope(apiscope.TemplatesRead), server.getTemplateVersion)
+	router.POST("/v1/templates/:key/versions/:version/publish", server.requireScope(apiscope.TemplatesWrite), server.publishTemplateVersion)
+	router.POST("/v1/templates/:key/preview", server.requireScope(apiscope.TemplatesRead), server.previewTemplate)
 	router.GET("/v1/domains", server.requireScope(apiscope.DomainsRead), server.listDomains)
 	router.POST("/v1/domains", server.requireScope(apiscope.DomainsWrite), server.createDomain)
 	router.POST("/v1/domains/:id/verify", server.requireScope(apiscope.DomainsWrite), server.verifyDomain)
@@ -643,23 +655,57 @@ func (s *Server) createNotification(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": message})
 		return
 	}
-	payload, err := json.Marshal(notification)
+	if notification.Template == nil {
+		if message := validateContent(notification); message != "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": message})
+			return
+		}
+	} else if message := validateTemplateRequest(notification); message != "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": message})
+		return
+	}
+	// The idempotency hash covers the request as sent, so a replay still matches after the
+	// template's published version changes.
+	request, err := json.Marshal(notification)
 	if err != nil {
 		s.logger.ErrorContext(c.Request.Context(), "could not encode validated notification", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not process notification"})
 		return
 	}
+	requestHash := sha256.Sum256(request)
 	accountID, err := uuid.Parse(s.accountIDFor(c))
 	if err != nil {
 		s.logger.ErrorContext(c.Request.Context(), "authenticated account ID is invalid", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not accept notification"})
 		return
 	}
+	if notification.Template != nil {
+		if s.templates == nil {
+			c.JSON(http.StatusNotImplemented, gin.H{"error": "templates are unavailable"})
+			return
+		}
+		result := s.renderTemplate(c, accountID, *notification.Template, notification.Channels)
+		if result.status != 0 {
+			c.JSON(result.status, gin.H{"error": result.message})
+			return
+		}
+		applyRendered(&notification, result)
+		if message := validateContent(notification); message != "" {
+			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "rendered template is invalid: " + message})
+			return
+		}
+	}
+	payload, err := json.Marshal(notification)
+	if err != nil {
+		s.logger.ErrorContext(c.Request.Context(), "could not encode notification", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not process notification"})
+		return
+	}
 	// The audit event is written in the same transaction as the message, so an accepted
 	// message is never left unaudited and a failed audit never reports an accepted message
 	// as a server error.
 	messageID, duplicate, err := s.store.AcceptAuditedNotification(
-		c.Request.Context(), accountID.String(), idempotencyKey, notification, payload,
+		c.Request.Context(), accountID.String(), idempotencyKey, notification, payload, requestHash[:],
 		&store.AuditEvent{
 			AccountID: accountID, APIKeyID: apiKeyID(c), Action: "notification.accepted",
 			Resource: "message", RequestID: observability.RequestID(c),
@@ -1406,9 +1452,6 @@ func validateNotification(notification store.Notification) string {
 			seenOrder[channel] = struct{}{}
 		}
 	}
-	if strings.TrimSpace(notification.Content.Body) == "" || len(notification.Content.Body) > 100_000 {
-		return "content.body must be non-empty and at most 100000 bytes"
-	}
 	if notification.TrafficClass != "" &&
 		notification.TrafficClass != "transactional" &&
 		notification.TrafficClass != "marketing" {
@@ -1423,11 +1466,6 @@ func validateNotification(notification store.Notification) string {
 		if err != nil || address.Address != notification.Recipient.Email || len(notification.Recipient.Email) > 254 {
 			return "recipient.email must be a valid email address when email is requested"
 		}
-		if strings.TrimSpace(notification.Content.Subject) == "" ||
-			len(notification.Content.Subject) > 255 ||
-			strings.ContainsAny(notification.Content.Subject, "\r\n") {
-			return "content.subject must be between 1 and 255 characters when email is requested"
-		}
 	}
 	if slices.Contains(notification.Channels, "sms") {
 		if _, err := parseE164(notification.Recipient.Phone); err != nil {
@@ -1435,4 +1473,55 @@ func validateNotification(notification store.Notification) string {
 		}
 	}
 	return ""
+}
+
+// validateContent checks a notification's content, whether sent directly or rendered from a
+// template.
+func validateContent(notification store.Notification) string {
+	content := notification.Content
+	if strings.TrimSpace(content.Body) == "" || len(content.Body) > 100_000 {
+		return "content.body must be non-empty and at most 100000 bytes"
+	}
+	if len(content.HTML) > 500_000 {
+		return "content.html must be at most 500000 bytes"
+	}
+	if len(content.SMS) > 1_600 {
+		return "content.sms must be at most 1600 bytes"
+	}
+	if slices.Contains(notification.Channels, "email") &&
+		(strings.TrimSpace(content.Subject) == "" || len(content.Subject) > 255 ||
+			strings.ContainsAny(content.Subject, "\r\n")) {
+		return "content.subject must be between 1 and 255 characters when email is requested"
+	}
+	return ""
+}
+
+// validateTemplateRequest checks that a templated notification sends no content of its own.
+func validateTemplateRequest(notification store.Notification) string {
+	content := notification.Content
+	if content.Subject != "" || content.Body != "" || content.HTML != "" || content.SMS != "" {
+		return "send either content or template, not both"
+	}
+	if notification.Template.Locale != "" {
+		if _, err := rendering.NormalizeLocale(notification.Template.Locale); err != nil {
+			return "template.locale must be a BCP 47 language tag"
+		}
+	}
+	return ""
+}
+
+// applyRendered fills a templated notification's content from the rendered template and
+// records the version and locale used. The template data is dropped: it is only for rendering.
+func applyRendered(notification *store.Notification, result renderResult) {
+	rendered := result.rendered
+	notification.Content.Subject = rendered.EmailSubject
+	notification.Content.Body = rendered.EmailText
+	notification.Content.HTML = rendered.EmailHTML
+	notification.Content.SMS = rendered.SMSText
+	if notification.Content.Body == "" {
+		notification.Content.Body = rendered.SMSText
+	}
+	notification.Template = &store.TemplateRef{
+		Key: notification.Template.Key, Version: result.version, Locale: rendered.Locale,
+	}
 }

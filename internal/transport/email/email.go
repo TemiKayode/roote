@@ -21,6 +21,7 @@ type Message struct {
 	To                string
 	Subject           string
 	Body              string
+	HTML              string
 	TrafficClass      string
 	UnsubscribeURL    string
 	DKIMDomain        string
@@ -126,6 +127,9 @@ func composeAndSign(message Message) ([]byte, error) {
 		msg.SetGenHeader(gomail.Header("X-Notification-Traffic-Class"), message.TrafficClass)
 	}
 	msg.SetBodyString(gomail.TypeTextPlain, message.Body)
+	if message.HTML != "" {
+		msg.AddAlternativeString(gomail.TypeTextHTML, message.HTML)
+	}
 	msg.SetMessageID()
 	headerKeys := []string{"From", "To", "Subject", "Date", "Message-ID", "MIME-Version", "Content-Type", "X-Notification-Message-ID"}
 	if message.TrafficClass == "marketing" {

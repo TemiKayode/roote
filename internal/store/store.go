@@ -46,19 +46,32 @@ type Store struct {
 }
 
 type Notification struct {
-	Event        string   `json:"event"`
-	Channels     []string `json:"channels"`
-	TrafficClass string   `json:"traffic_class,omitempty"`
-	Region       string   `json:"region,omitempty"`
-	Routing      Routing  `json:"routing,omitempty"`
+	Event        string       `json:"event"`
+	Channels     []string     `json:"channels"`
+	TrafficClass string       `json:"traffic_class,omitempty"`
+	Region       string       `json:"region,omitempty"`
+	Routing      Routing      `json:"routing,omitempty"`
+	Template     *TemplateRef `json:"template,omitempty"`
 	Recipient    struct {
 		Email string `json:"email,omitempty"`
 		Phone string `json:"phone,omitempty"`
 	} `json:"recipient"`
 	Content struct {
 		Subject string `json:"subject,omitempty"`
-		Body    string `json:"body"`
+		Body    string `json:"body,omitempty"`
+		HTML    string `json:"html,omitempty"`
+		SMS     string `json:"sms,omitempty"`
 	} `json:"content"`
+}
+
+// TemplateRef names the template a notification is rendered from. In a request, Version and
+// Locale are optional; the stored notification records the version and locale actually used.
+// Data is used only for rendering and is not stored.
+type TemplateRef struct {
+	Key     string         `json:"key"`
+	Version int            `json:"version,omitempty"`
+	Locale  string         `json:"locale,omitempty"`
+	Data    map[string]any `json:"data,omitempty"`
 }
 
 type Routing struct {
@@ -103,6 +116,7 @@ type EmailJob struct {
 	Recipient    string
 	Subject      string
 	Body         string
+	HTML         string
 	TrafficClass string
 	Routing      Routing
 }
@@ -659,6 +673,9 @@ func (s *Store) GetSMSJob(ctx context.Context, messageID uuid.UUID) (SMSJob, err
 	job.ID = messageID
 	job.Recipient = notification.Recipient.Phone
 	job.Body = notification.Content.Body
+	if notification.Content.SMS != "" {
+		job.Body = notification.Content.SMS
+	}
 	job.TrafficClass = notification.TrafficClass
 	job.Region = notification.Region
 	job.Routing = notification.Routing
@@ -1770,6 +1787,7 @@ func (s *Store) GetEmailJob(ctx context.Context, messageID uuid.UUID) (EmailJob,
 	job.Recipient = notification.Recipient.Email
 	job.Subject = notification.Content.Subject
 	job.Body = notification.Content.Body
+	job.HTML = notification.Content.HTML
 	job.TrafficClass = notification.TrafficClass
 	job.Region = notification.Region
 	job.Routing = notification.Routing
@@ -2053,20 +2071,27 @@ func (s *Store) AcceptNotification(
 	notification Notification,
 	request []byte,
 ) (uuid.UUID, bool, error) {
-	return s.AcceptAuditedNotification(ctx, accountID, idempotencyKey, notification, request, nil)
+	return s.AcceptAuditedNotification(ctx, accountID, idempotencyKey, notification, request, nil, nil)
 }
 
 // AcceptAuditedNotification is AcceptNotification that also writes audit, when non-nil, in the
 // same transaction as a newly accepted message. The audit's ResourceID is set to the message ID.
-// Idempotent replays are not audited again.
+// Idempotent replays are not audited again. payload is the notification as stored (for a
+// template, already rendered); requestHash, when non-nil, identifies the request as the client
+// sent it, so a replay matches even if the template's published version changed since.
 func (s *Store) AcceptAuditedNotification(
 	ctx context.Context,
 	accountID, idempotencyKey string,
 	notification Notification,
-	request []byte,
+	payload []byte,
+	requestHash []byte,
 	audit *AuditEvent,
 ) (uuid.UUID, bool, error) {
-	requestHash := sha256.Sum256(request)
+	if requestHash == nil {
+		sum := sha256.Sum256(payload)
+		requestHash = sum[:]
+	}
+	request := payload
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return uuid.Nil, false, fmt.Errorf("begin notification transaction: %w", err)
@@ -2082,7 +2107,7 @@ func (s *Store) AcceptAuditedNotification(
 		VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, ''))
 		ON CONFLICT (account_id, idempotency_key) DO NOTHING
 		RETURNING id`, accountID, idempotencyKey, notification.Event, notification.Channels,
-		request, requestHash[:], notification.Region).Scan(&messageID)
+		request, requestHash, notification.Region).Scan(&messageID)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return uuid.Nil, false, fmt.Errorf("insert message: %w", err)
 	}
@@ -2095,7 +2120,7 @@ func (s *Store) AcceptAuditedNotification(
 			WHERE account_id = $1 AND idempotency_key = $2`, accountID, idempotencyKey).Scan(&messageID, &existingHash); err != nil {
 			return uuid.Nil, false, fmt.Errorf("load idempotent message: %w", err)
 		}
-		if !equalBytes(existingHash, requestHash[:]) {
+		if !equalBytes(existingHash, requestHash) {
 			return uuid.Nil, false, ErrIdempotencyConflict
 		}
 		if err := tx.Commit(ctx); err != nil {

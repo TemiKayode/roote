@@ -42,6 +42,11 @@ func (t *SendGridTransport) Send(ctx context.Context, message Message) (string, 
 	if message.TrafficClass == "marketing" {
 		ipPool = t.marketingPool
 	}
+	// SendGrid requires text/plain before text/html.
+	content := []sendGridContent{{Type: "text/plain", Value: message.Body}}
+	if message.HTML != "" {
+		content = append(content, sendGridContent{Type: "text/html", Value: message.HTML})
+	}
 	payload, err := json.Marshal(sendGridRequest{
 		Personalizations: []sendGridPersonalization{{
 			To:         []sendGridAddress{{Email: message.To}},
@@ -49,7 +54,7 @@ func (t *SendGridTransport) Send(ctx context.Context, message Message) (string, 
 			CustomArgs: map[string]string{"message_id": message.ID},
 		}},
 		From:       sendGridAddress{Email: message.From},
-		Content:    []sendGridContent{{Type: "text/plain", Value: message.Body}},
+		Content:    content,
 		IPPoolName: ipPool,
 	})
 	if err != nil {

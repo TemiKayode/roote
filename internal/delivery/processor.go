@@ -313,6 +313,7 @@ func (p *Processor) deliverEmail(ctx context.Context, job store.EmailJob) error 
 	if err != nil {
 		return p.failChannelPermanently(ctx, messageID, "email", err.Error())
 	}
+	message.HTML = job.HTML
 	sender := emailCapacityIdentity(
 		p.transport.Provider(), job.TrafficClass, parts[1],
 		p.config.SendGridTransactionalPool, p.config.SendGridMarketingPool,
