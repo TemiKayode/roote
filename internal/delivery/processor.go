@@ -16,6 +16,7 @@ import (
 
 	"github.com/TemiKayode/roote/internal/config"
 	"github.com/TemiKayode/roote/internal/emaildomain"
+	"github.com/TemiKayode/roote/internal/secret"
 	"github.com/TemiKayode/roote/internal/store"
 	"github.com/TemiKayode/roote/internal/transport/email"
 	"github.com/TemiKayode/roote/internal/transport/sms"
@@ -305,7 +306,11 @@ func (p *Processor) deliverEmail(ctx context.Context, job store.EmailJob) error 
 	if err != nil {
 		return fmt.Errorf("load sender DKIM key: %w", err)
 	}
-	privateKeyPEM, err := emaildomain.DecryptPrivateKey(p.config.DKIMEncryptionKey, dkimKey.EncryptedPrivateKey)
+	keyring, err := secret.NewKeyring(p.config.DKIMEncryptionKey, p.config.DKIMPreviousKeys...)
+	if err != nil {
+		return p.failChannelPermanently(ctx, messageID, "email", "DKIM_ENCRYPTION_KEY is not configured")
+	}
+	privateKeyPEM, err := keyring.Decrypt(dkimKey.EncryptedPrivateKey)
 	if err != nil {
 		return p.failChannelPermanently(ctx, messageID, "email", "could not decrypt sender DKIM key")
 	}

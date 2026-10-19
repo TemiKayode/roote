@@ -21,12 +21,19 @@ import (
 )
 
 type Sender struct {
-	client *http.Client
-	key    []byte
+	client  *http.Client
+	keyring *secret.Keyring
+	// keyErr is reported on every send when the configured keys are unusable.
+	keyErr error
 }
 
-func NewSender(encryptionKey []byte) *Sender {
+// NewSender returns a sender that decrypts signing secrets with encryptionKey or, during a
+// key rotation, any of the previous keys.
+func NewSender(encryptionKey []byte, previous ...[]byte) *Sender {
+	keyring, keyErr := secret.NewKeyring(encryptionKey, previous...)
 	return &Sender{
+		keyring: keyring,
+		keyErr:  keyErr,
 		client: &http.Client{
 			Timeout: 10 * time.Second,
 			CheckRedirect: func(*http.Request, []*http.Request) error {
@@ -34,7 +41,6 @@ func NewSender(encryptionKey []byte) *Sender {
 			},
 			Transport: &http.Transport{DialContext: safeDialContext},
 		},
-		key: encryptionKey,
 	}
 }
 
@@ -43,7 +49,10 @@ func (s *Sender) Send(ctx context.Context, delivery store.WebhookDelivery) (int,
 	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil {
 		return 0, fmt.Errorf("webhook endpoint must be an absolute HTTPS URL")
 	}
-	secretBytes, err := secret.Decrypt(s.key, delivery.EncryptedSecret)
+	if s.keyErr != nil {
+		return 0, fmt.Errorf("webhook encryption key: %w", s.keyErr)
+	}
+	secretBytes, err := s.keyring.Decrypt(delivery.EncryptedSecret)
 	if err != nil {
 		return 0, fmt.Errorf("decrypt webhook signing secret: %w", err)
 	}

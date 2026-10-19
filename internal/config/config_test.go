@@ -1,6 +1,10 @@
 package config
 
-import "testing"
+import (
+	"bytes"
+	"encoding/base64"
+	"testing"
+)
 
 func setBaseEnvironment(t *testing.T) {
 	t.Helper()
@@ -126,5 +130,28 @@ func TestLoadRejectsInvalidAPIAuthAndWarmupConfiguration(t *testing.T) {
 	t.Setenv("EMAIL_WARMUP_MAXIMUM_LIMIT", "999")
 	if _, err := Load(); err == nil {
 		t.Fatal("Load() accepted a warm-up maximum below its initial limit")
+	}
+}
+
+func TestLoadParsesPreviousEncryptionKeys(t *testing.T) {
+	setBaseEnvironment(t)
+	current := base64.StdEncoding.EncodeToString(make([]byte, 32))
+	previousA := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32))
+	previousB := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{2}, 32))
+	t.Setenv("WEBHOOK_ENCRYPTION_KEY", current)
+	t.Setenv("WEBHOOK_ENCRYPTION_KEY_PREVIOUS", previousA+", "+previousB)
+	t.Setenv("DKIM_ENCRYPTION_KEY_PREVIOUS", "")
+	cfg, err := Load()
+	if err != nil || len(cfg.WebhookPreviousKeys) != 2 || cfg.WebhookPreviousKeys[1][0] != 2 {
+		t.Fatalf("Load() previous keys = %d, error = %v", len(cfg.WebhookPreviousKeys), err)
+	}
+	t.Setenv("WEBHOOK_ENCRYPTION_KEY_PREVIOUS", "not-base64")
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() accepted an invalid previous key")
+	}
+	t.Setenv("WEBHOOK_ENCRYPTION_KEY_PREVIOUS", previousA)
+	t.Setenv("WEBHOOK_ENCRYPTION_KEY", "")
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() accepted previous keys without a current key")
 	}
 }

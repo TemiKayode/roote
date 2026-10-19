@@ -73,7 +73,7 @@ func TestSenderSignsExactRequestBody(t *testing.T) {
 		t.Fatal(err)
 	}
 	payload := []byte(`{"id":"evt-1","type":"notification.accepted"}`)
-	sender := &Sender{key: encryptionKey}
+	sender := NewSender(encryptionKey)
 	sender.client = &http.Client{Transport: roundTripperFunc(func(request *http.Request) (*http.Response, error) {
 		body, err := io.ReadAll(request.Body)
 		if err != nil {

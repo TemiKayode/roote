@@ -126,6 +126,8 @@ Direct sends can also include `content.html` (up to 500 KB) for an HTML email pa
 
 **Delivery reconciliation (Phase 2).** Every five minutes the worker asks Twilio or Telnyx for the status of SMS that the provider accepted more than 15 minutes ago and that have no final receipt, and applies the answer exactly as a status callback would (terminal status, customer webhook). Each message is checked at most every 15 minutes and for up to 72 hours; claims use `SKIP LOCKED`, so several workers do not poll the same message. SendGrid and SMTP offer no per-message status lookup, so email is not polled: `GET /v1/ops/summary` reports `unconfirmed_email` and `unconfirmed_sms`, the provider-accepted messages still without a receipt after 24 hours. A growing `unconfirmed_email` count usually means the SendGrid Event Webhook is not configured. Twilio `canceled`, `read`, and `scheduled` statuses are now recognized. Migration 10 adds the reconciliation timestamp and indexes.
 
+**Encryption-key rotation (Phase 2).** DKIM keys and webhook signing secrets can be moved to a new encryption key without downtime using `*_ENCRYPTION_KEY_PREVIOUS` and `admin rotate-secrets`; see "Secrets, backups, deployment, and incidents".
+
 ## Build steps
 
 1. Install Go 1.24+ and Docker Desktop with Compose.
@@ -258,7 +260,13 @@ The existing SMS account minute-rate and country monthly USD budgets remain addi
 
 ### Secrets, backups, deployment, and incidents
 
-- Supply provider credentials and the 32-byte DKIM/webhook encryption keys through a secret manager. Restrict access and preserve encrypted backups of those keys separately from the database backup. Rotating either encryption key without re-encrypting stored values makes existing stored secrets unreadable; this release does not implement online encryption-key rotation.
+- Supply provider credentials and the 32-byte DKIM/webhook encryption keys through a secret manager. Restrict access and preserve encrypted backups of those keys separately from the database backup.
+- To rotate `DKIM_ENCRYPTION_KEY` or `WEBHOOK_ENCRYPTION_KEY` without downtime:
+  1. Generate a new 32-byte key. Deploy it as the current key, with the old key in `DKIM_ENCRYPTION_KEY_PREVIOUS` or `WEBHOOK_ENCRYPTION_KEY_PREVIOUS` (comma-separated if several). API and worker now seal new secrets with the new key and still read secrets sealed with the old one.
+  2. Run `docker compose run --rm --no-deps --entrypoint /app/admin api rotate-secrets`. It re-encrypts every stored DKIM key and webhook signing secret under the current key in one transaction per kind and prints the counts. Run it again: it should report `0` for both.
+  3. Remove the `*_PREVIOUS` variable and redeploy. Keep the old key in your secret manager until a backup taken after step 2 has been verified.
+
+  Stored ciphertexts record a fingerprint of the key that sealed them; data written before this release still decrypts. Removing a previous key before `rotate-secrets` succeeds makes the secrets it sealed unreadable.
 - Back up PostgreSQL before applying migrations or changing retention settings. Test restoration of the database and encryption keys together. The Asynq queue is Redis-backed; keep Redis persistence enabled and monitor readiness, queue latency, retry counts, and archived tasks.
 - Database migrations are versioned and applied on service startup. Roll out API and worker binaries that contain the same migration set; take a backup first and avoid concurrent incompatible releases.
 - For a provider outage, pause provider-side sending if possible, verify provider status/credentials, monitor queue growth and SMS budgets, and allow configured retries to resume when healthy. Avoid manually retrying tasks until the cause is fixed.
@@ -275,4 +283,4 @@ The existing SMS account minute-rate and country monthly USD budgets remain addi
 - Exactly-once delivery cannot be guaranteed across a provider acceptance followed by a process crash before PostgreSQL records the response. Providers may accept a retry as a duplicate; this remains an at-least-once system.
 - Configure secrets from a secret manager in deployed environments; never reuse `.env.example` credentials.
 - Regional notification metadata is persisted but does not itself select a region or route traffic across regions. Configure and test external regional isolation before relying on it.
-- Before production, choose deployment region/provider, set a retention policy, and establish managed key-rotation/recovery procedures.
+- Before production, choose deployment region/provider, set a retention policy, and schedule encryption-key rotation using the procedure above.

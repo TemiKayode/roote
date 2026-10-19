@@ -16,6 +16,7 @@ import (
 
 	"github.com/TemiKayode/roote/internal/apiscope"
 	"github.com/TemiKayode/roote/internal/config"
+	"github.com/TemiKayode/roote/internal/secret"
 	"github.com/TemiKayode/roote/internal/store"
 )
 
@@ -36,7 +37,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: admin create-key|revoke-key [flags]")
+		return errors.New("usage: admin create-key|revoke-key|rotate-secrets [flags]")
 	}
 	cfg, err := config.Load()
 	if err != nil {
@@ -59,8 +60,10 @@ func run(args []string) error {
 		return createKey(ctx, database, accountID, args[1:])
 	case "revoke-key":
 		return revokeKey(ctx, database, accountID, args[1:])
+	case "rotate-secrets":
+		return rotateSecrets(ctx, database, cfg, args[1:])
 	default:
-		return fmt.Errorf("unknown command %q; use create-key or revoke-key", args[0])
+		return fmt.Errorf("unknown command %q; use create-key, revoke-key, or rotate-secrets", args[0])
 	}
 }
 
@@ -152,4 +155,53 @@ func parseScopes(value string) ([]string, error) {
 		}
 	}
 	return scopes, nil
+}
+
+// rotateSecrets re-encrypts stored DKIM keys and webhook signing secrets under the current
+// DKIM_ENCRYPTION_KEY and WEBHOOK_ENCRYPTION_KEY. Run it after deploying a new current key
+// with the old one in *_ENCRYPTION_KEY_PREVIOUS; once it reports success, the previous keys
+// can be removed.
+func rotateSecrets(ctx context.Context, database *store.Store, cfg config.Config, args []string) error {
+	if len(args) != 0 {
+		return errors.New("rotate-secrets accepts no arguments")
+	}
+	type target struct {
+		name     string
+		current  []byte
+		previous [][]byte
+		run      func(context.Context, store.Reseal) (int, error)
+	}
+	for _, item := range []target{
+		{"DKIM keys", cfg.DKIMEncryptionKey, cfg.DKIMPreviousKeys, database.ReencryptDKIMKeys},
+		{"webhook signing secrets", cfg.WebhookEncryptionKey, cfg.WebhookPreviousKeys, database.ReencryptWebhookSecrets},
+	} {
+		if len(item.current) == 0 {
+			fmt.Printf("Skipped %s: no current encryption key is configured\n", item.name)
+			continue
+		}
+		keyring, err := secret.NewKeyring(item.current, item.previous...)
+		if err != nil {
+			return fmt.Errorf("build %s keyring: %w", item.name, err)
+		}
+		changed, err := item.run(ctx, resealWith(keyring))
+		if err != nil {
+			return fmt.Errorf("rotate %s: %w", item.name, err)
+		}
+		fmt.Printf("Re-encrypted %d %s\n", changed, item.name)
+	}
+	return nil
+}
+
+func resealWith(keyring *secret.Keyring) store.Reseal {
+	return func(ciphertext []byte) ([]byte, bool, error) {
+		if keyring.IsCurrent(ciphertext) {
+			return nil, false, nil
+		}
+		plaintext, err := keyring.Decrypt(ciphertext)
+		if err != nil {
+			return nil, false, err
+		}
+		resealed, err := keyring.Encrypt(plaintext)
+		return resealed, err == nil, err
+	}
 }

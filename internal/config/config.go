@@ -34,6 +34,9 @@ type Config struct {
 	LogLevel                  slog.Level
 	DKIMEncryptionKey         []byte
 	WebhookEncryptionKey      []byte
+	// Previous keys still decrypt during a key rotation; new data is sealed with the current key.
+	DKIMPreviousKeys          [][]byte
+	WebhookPreviousKeys       [][]byte
 	SendGridWebhookPublicKey  string
 	EmailTransport            string
 	EmailFrom                 string
@@ -126,6 +129,14 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	dkimPrevious, err := decodePreviousKeys("DKIM_ENCRYPTION_KEY_PREVIOUS", encryptionKey)
+	if err != nil {
+		return Config{}, err
+	}
+	webhookPrevious, err := decodePreviousKeys("WEBHOOK_ENCRYPTION_KEY_PREVIOUS", webhookEncryptionKey)
+	if err != nil {
+		return Config{}, err
+	}
 	smtpPort, err := strconv.Atoi(env("SMTP_PORT", "2525"))
 	if err != nil || smtpPort < 1 || smtpPort > 65535 {
 		return Config{}, fmt.Errorf("SMTP_PORT must be an integer between 1 and 65535")
@@ -167,6 +178,8 @@ func Load() (Config, error) {
 		LogLevel:                  level,
 		DKIMEncryptionKey:         encryptionKey,
 		WebhookEncryptionKey:      webhookEncryptionKey,
+		DKIMPreviousKeys:          dkimPrevious,
+		WebhookPreviousKeys:       webhookPrevious,
 		SendGridWebhookPublicKey: strings.ReplaceAll(
 			strings.TrimSpace(os.Getenv("SENDGRID_WEBHOOK_PUBLIC_KEY")), `\n`, "\n",
 		),
@@ -321,6 +334,30 @@ func decodeOptionalBase64(key, value string) ([]byte, error) {
 		return nil, fmt.Errorf("%s must decode to exactly 32 bytes", key)
 	}
 	return decoded, nil
+}
+
+// decodePreviousKeys parses a comma-separated list of standard-base64 32-byte keys. Previous
+// keys only make sense alongside a current key.
+func decodePreviousKeys(name string, current []byte) ([][]byte, error) {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return nil, nil
+	}
+	if len(current) == 0 {
+		return nil, fmt.Errorf("%s requires the corresponding current encryption key", name)
+	}
+	var keys [][]byte
+	for _, item := range strings.Split(value, ",") {
+		key, err := decodeOptionalBase64(name, item)
+		if err != nil {
+			return nil, err
+		}
+		if key == nil {
+			return nil, fmt.Errorf("%s contains an empty key", name)
+		}
+		keys = append(keys, key)
+	}
+	return keys, nil
 }
 
 func env(key, fallback string) string {

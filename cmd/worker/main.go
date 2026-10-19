@@ -56,7 +56,7 @@ func run() error {
 		return fmt.Errorf("configure SMS transport: %w", err)
 	}
 	processor := delivery.NewProcessor(database, emailTransport, smsTransport, cfg, logger)
-	webhookSender := webhook.NewSender(cfg.WebhookEncryptionKey)
+	webhookSender := webhook.NewSender(cfg.WebhookEncryptionKey, cfg.WebhookPreviousKeys...)
 	webhookHandler := webhook.NewHandler(database, webhookSender)
 
 	redis := asynq.RedisClientOpt{Addr: cfg.RedisURL}
