@@ -22,6 +22,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	securesecret "github.com/TemiKayode/roote/internal/secret"
 	"github.com/TemiKayode/roote/internal/store"
 )
 
@@ -30,6 +31,35 @@ type fakeStore struct {
 	hash    [32]byte
 	created bool
 	calls   int
+}
+
+type fakeMilestoneFourStore struct {
+	*fakeStore
+	preferenceChannel string
+	preferenceEnabled bool
+	webhookURL        string
+	webhookSecret     []byte
+	webhookEvents     []string
+}
+
+func (f *fakeMilestoneFourStore) SetNotificationPreference(
+	_ context.Context, _ uuid.UUID, _ string, channel string, enabled bool,
+) error {
+	f.preferenceChannel, f.preferenceEnabled = channel, enabled
+	return nil
+}
+
+func (f *fakeMilestoneFourStore) CreateWebhookEndpoint(
+	_ context.Context,
+	_ uuid.UUID,
+	endpointURL string,
+	encryptedSecret []byte,
+	events []string,
+) (uuid.UUID, error) {
+	f.webhookURL = endpointURL
+	f.webhookSecret = append([]byte(nil), encryptedSecret...)
+	f.webhookEvents = append([]string(nil), events...)
+	return uuid.New(), nil
 }
 
 type fakeSMSStore struct {
@@ -144,6 +174,29 @@ func TestCreateNotificationRejectsInvalidRecipient(t *testing.T) {
 	}
 }
 
+func TestValidateNotificationRoutingModesAndOrder(t *testing.T) {
+	notification := store.Notification{
+		Event:    "receipt",
+		Channels: []string{"email", "sms"},
+		Routing:  store.Routing{Strategy: "waterfall", Order: []string{"sms", "email"}},
+	}
+	notification.Recipient.Email = "person@example.com"
+	notification.Recipient.Phone = "+14155552671"
+	notification.Content.Subject = "Receipt"
+	notification.Content.Body = "Your order is confirmed."
+	if message := validateNotification(notification); message != "" {
+		t.Fatalf("valid waterfall routing rejected: %s", message)
+	}
+	notification.Routing.Order = []string{"email"}
+	if message := validateNotification(notification); message == "" {
+		t.Fatal("incomplete waterfall channel order was accepted")
+	}
+	notification.Routing = store.Routing{Strategy: "random"}
+	if message := validateNotification(notification); message == "" {
+		t.Fatal("unsupported routing strategy was accepted")
+	}
+}
+
 func TestSMSConsentRequiresValidExplicitInput(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	repository := &fakeSMSStore{}
@@ -255,6 +308,81 @@ func TestCreateNotificationRejectsUnknownFields(t *testing.T) {
 	}
 	if repository.calls != 0 {
 		t.Fatalf("invalid request reached store %d times", repository.calls)
+	}
+}
+
+func TestPreferenceAndCustomerWebhookConfiguration(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	repository := &fakeMilestoneFourStore{fakeStore: &fakeStore{}}
+	encryptionKey := bytes.Repeat([]byte{7}, 32)
+	router := NewWithAllFeatures(
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		uuid.NewString(),
+		repository,
+		EmailFeatures{},
+		SMSFeatures{},
+		CustomerWebhookFeatures{Store: repository, EncryptionKey: encryptionKey},
+	)
+
+	preferenceRequest := httptest.NewRequest(http.MethodPut, "/v1/preferences",
+		strings.NewReader(`{"channel":"email","recipient":"Person@example.net","enabled":true}`))
+	preferenceRequest.Header.Set("Content-Type", "application/json")
+	preferenceResponse := httptest.NewRecorder()
+	router.ServeHTTP(preferenceResponse, preferenceRequest)
+	if preferenceResponse.Code != http.StatusOK || repository.preferenceChannel != "email" ||
+		!repository.preferenceEnabled {
+		t.Fatalf("preference status = %d, saved = %s/%t: %s",
+			preferenceResponse.Code, repository.preferenceChannel, repository.preferenceEnabled,
+			preferenceResponse.Body)
+	}
+
+	webhookRequest := httptest.NewRequest(http.MethodPost, "/v1/webhooks",
+		strings.NewReader(`{"url":"https://hooks.example.net/events","events":["notification.accepted","notification.delivered"]}`))
+	webhookRequest.Header.Set("Content-Type", "application/json")
+	webhookResponse := httptest.NewRecorder()
+	router.ServeHTTP(webhookResponse, webhookRequest)
+	if webhookResponse.Code != http.StatusCreated || repository.webhookURL != "https://hooks.example.net/events" ||
+		len(repository.webhookSecret) == 0 || len(repository.webhookEvents) != 2 {
+		t.Fatalf("webhook status = %d, endpoint = %+v: %s",
+			webhookResponse.Code, repository, webhookResponse.Body)
+	}
+	var response struct {
+		SigningSecret string `json:"signing_secret"`
+	}
+	if err := json.Unmarshal(webhookResponse.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.SigningSecret == "" {
+		t.Fatal("webhook signing secret was not returned on creation")
+	}
+	signingSecret, err := base64.RawURLEncoding.DecodeString(response.SigningSecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decrypted, err := securesecret.Decrypt(encryptionKey, repository.webhookSecret)
+	if err != nil || !bytes.Equal(decrypted, signingSecret) {
+		t.Fatalf("persisted encrypted key does not match returned signing secret: %v", err)
+	}
+}
+
+func TestCustomerWebhookRejectsInsecureDestination(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	repository := &fakeMilestoneFourStore{fakeStore: &fakeStore{}}
+	router := NewWithAllFeatures(
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		uuid.NewString(),
+		repository,
+		EmailFeatures{},
+		SMSFeatures{},
+		CustomerWebhookFeatures{Store: repository, EncryptionKey: bytes.Repeat([]byte{1}, 32)},
+	)
+	request := httptest.NewRequest(http.MethodPost, "/v1/webhooks",
+		strings.NewReader(`{"url":"http://hooks.example.net/events","events":["notification.accepted"]}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("insecure webhook status = %d, want 400: %s", response.Code, response.Body)
 	}
 }
 

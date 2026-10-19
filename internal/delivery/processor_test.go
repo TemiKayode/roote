@@ -21,6 +21,7 @@ type fakeRepository struct {
 	job                   store.EmailJob
 	dkimKey               store.DKIMKey
 	suppressed            bool
+	preferred             bool
 	beginCount            int
 	completeCount         int
 	failureReason         string
@@ -33,6 +34,10 @@ type fakeRepository struct {
 	smsSendCount          int
 	smsComplete           int
 	smsConfirmationBudget float64
+	preferredChannels     map[string]bool
+	channelFailures       []string
+	channelSkips          []string
+	failureWebhookCount   int
 }
 
 func (f *fakeRepository) GetDomain(context.Context, string, uuid.UUID) (store.Domain, error) {
@@ -56,9 +61,15 @@ func (f *fakeRepository) GetDKIMKey(context.Context, uuid.UUID, string) (store.D
 func (f *fakeRepository) IsEmailSuppressed(context.Context, uuid.UUID, string) (bool, error) {
 	return f.suppressed, nil
 }
-func (f *fakeRepository) BeginEmailDelivery(context.Context, store.EmailJob, string) error {
+func (f *fakeRepository) IsNotificationPreferred(_ context.Context, _ uuid.UUID, _, channel string) (bool, error) {
+	if f.preferredChannels != nil {
+		return f.preferredChannels[channel], nil
+	}
+	return f.preferred, nil
+}
+func (f *fakeRepository) BeginEmailDelivery(context.Context, store.EmailJob, string) (bool, error) {
 	f.beginCount++
-	return nil
+	return true, nil
 }
 func (f *fakeRepository) CompleteEmailDelivery(_ context.Context, _ uuid.UUID, providerID string) error {
 	f.completeCount++
@@ -102,19 +113,35 @@ func (f *fakeRepository) MarkMessageFailed(_ context.Context, _ uuid.UUID, reaso
 	f.failureReason = reason
 	return nil
 }
+func (f *fakeRepository) RecordChannelFailure(
+	_ context.Context, _ uuid.UUID, channel, _ string,
+) error {
+	f.channelFailures = append(f.channelFailures, channel)
+	return nil
+}
+func (f *fakeRepository) RecordChannelSkipped(_ context.Context, _ uuid.UUID, channel string) error {
+	f.channelSkips = append(f.channelSkips, channel)
+	return nil
+}
+func (f *fakeRepository) EmitNotificationFailure(context.Context, uuid.UUID) error {
+	f.failureWebhookCount++
+	return nil
+}
 
 type fakeTransport struct {
 	message email.Message
+	err     error
 }
 
 type fakeSMSTransport struct {
 	message sms.Message
+	err     error
 }
 
 func (f *fakeSMSTransport) Provider() string { return "test-sms" }
 func (f *fakeSMSTransport) Send(_ context.Context, message sms.Message) (string, error) {
 	f.message = message
-	return "sms-provider-id", nil
+	return "sms-provider-id", f.err
 }
 
 func (f *fakeTransport) Provider() string {
@@ -123,7 +150,7 @@ func (f *fakeTransport) Provider() string {
 
 func (f *fakeTransport) Send(_ context.Context, message email.Message) (string, error) {
 	f.message = message
-	return "provider-id", nil
+	return "provider-id", f.err
 }
 
 func TestDeliverNotificationUsesVerifiedDKIMAndPersistsProviderID(t *testing.T) {
@@ -187,8 +214,10 @@ func TestDeliverNotificationSkipsSuppressedRecipient(t *testing.T) {
 	if !errors.Is(err, asynq.SkipRetry) {
 		t.Fatalf("error = %v, want archived non-retryable task", err)
 	}
-	if repository.failureReason != "recipient is suppressed for email" || repository.beginCount != 0 {
-		t.Fatalf("suppressed delivery proceeded: failure=%q begin=%d", repository.failureReason, repository.beginCount)
+	if repository.beginCount != 0 || len(repository.channelFailures) != 1 ||
+		repository.channelFailures[0] != "email" {
+		t.Fatalf("suppressed delivery proceeded: channel failures=%v begin=%d",
+			repository.channelFailures, repository.beginCount)
 	}
 }
 
@@ -238,11 +267,206 @@ func TestDeliverSMSFailsClosedWithoutConsent(t *testing.T) {
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 	)
 	err := processor.DeliverNotification(context.Background(), messageID)
-	if !errors.Is(err, asynq.SkipRetry) || repository.failureReason != "active SMS consent is required" {
-		t.Fatalf("error = %v, failure reason = %q", err, repository.failureReason)
+	if !errors.Is(err, asynq.SkipRetry) || len(repository.channelFailures) != 1 ||
+		repository.channelFailures[0] != "sms" {
+		t.Fatalf("error = %v, channel failures = %v", err, repository.channelFailures)
 	}
 	if repository.smsSendCount != 0 || repository.smsReservedCost != 0 {
 		t.Fatal("SMS was budgeted or sent without consent")
+	}
+}
+
+func TestPreferenceRoutingSelectsOnlyEnabledChannel(t *testing.T) {
+	messageID, accountID := uuid.New(), uuid.New()
+	routing := store.Routing{Strategy: "preference"}
+	repository := &fakeRepository{
+		job: store.EmailJob{
+			ID: messageID, AccountID: accountID, Channels: []string{"email", "sms"},
+			Recipient: "person@example.net", Routing: routing,
+		},
+		smsJob: store.SMSJob{
+			ID: messageID, AccountID: accountID, Channels: []string{"email", "sms"},
+			Recipient: "+14155552671", Body: "Hello", Routing: routing,
+		},
+		preferredChannels: map[string]bool{"sms": true},
+		smsConsent:        true,
+	}
+	smsTransport := &fakeSMSTransport{}
+	processor := NewProcessor(
+		repository, nil, smsTransport,
+		config.Config{
+			SMSTransport:             "twilio",
+			SMSRateLimitPerMinute:    10,
+			SMSCountryRatesUSD:       map[string]float64{"US": 0.01},
+			SMSCountryMonthlyCapsUSD: map[string]float64{"US": 1},
+		},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	if err := processor.DeliverNotification(context.Background(), messageID); err != nil {
+		t.Fatal(err)
+	}
+	if repository.smsSendCount != 1 || repository.beginCount != 0 ||
+		smsTransport.message.To != "+14155552671" || len(repository.channelSkips) != 1 ||
+		repository.channelSkips[0] != "email" {
+		t.Fatalf("preference routing selected wrong channel: sms=%d email=%d message=%+v",
+			repository.smsSendCount, repository.beginCount, smsTransport.message)
+	}
+}
+
+func TestPreferenceRoutingFailsWhenAllChannelsAreDisabled(t *testing.T) {
+	messageID, accountID := uuid.New(), uuid.New()
+	repository := &fakeRepository{
+		job: store.EmailJob{
+			ID: messageID, AccountID: accountID, Channels: []string{"email", "sms"},
+			Recipient: "person@example.net", Routing: store.Routing{Strategy: "preference"},
+		},
+		smsJob: store.SMSJob{
+			ID: messageID, AccountID: accountID, Channels: []string{"email", "sms"},
+			Recipient: "+14155552671", Routing: store.Routing{Strategy: "preference"},
+		},
+		preferredChannels: map[string]bool{},
+	}
+	processor := NewProcessor(
+		repository, nil, nil, config.Config{},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	err := processor.DeliverNotification(context.Background(), messageID)
+	if !errors.Is(err, asynq.SkipRetry) || repository.failureWebhookCount != 1 ||
+		len(repository.channelFailures) != 2 {
+		t.Fatalf("no-preference result: error=%v failures=%v webhook=%d",
+			err, repository.channelFailures, repository.failureWebhookCount)
+	}
+}
+
+func TestWaterfallRoutingFallsBackAfterEmailFailure(t *testing.T) {
+	messageID, accountID := uuid.New(), uuid.New()
+	material, err := emaildomain.GenerateKeyMaterial()
+	if err != nil {
+		t.Fatal(err)
+	}
+	encryptionKey := make([]byte, 32)
+	for i := range encryptionKey {
+		encryptionKey[i] = 3
+	}
+	ciphertext, err := emaildomain.EncryptPrivateKey(encryptionKey, material.PrivatePEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routing := store.Routing{Strategy: "waterfall", Order: []string{"email", "sms"}}
+	repository := &fakeRepository{
+		job: store.EmailJob{
+			ID: messageID, AccountID: accountID, Channels: []string{"email", "sms"},
+			Recipient: "person@example.net", Subject: "Hello", Body: "World", Routing: routing,
+		},
+		dkimKey: store.DKIMKey{Selector: material.Selector, EncryptedPrivateKey: ciphertext},
+		smsJob: store.SMSJob{
+			ID: messageID, AccountID: accountID, Channels: []string{"email", "sms"},
+			Recipient: "+14155552671", Body: "Hello", Routing: routing,
+		},
+		smsConsent: true,
+	}
+	emailTransport := &fakeTransport{err: errors.New("permanent provider rejection")}
+	smsTransport := &fakeSMSTransport{}
+	processor := NewProcessor(
+		repository, emailTransport, smsTransport,
+		config.Config{
+			EmailFrom:                "notifications@example.org",
+			DKIMEncryptionKey:        encryptionKey,
+			SMSTransport:             "twilio",
+			SMSRateLimitPerMinute:    10,
+			SMSCountryRatesUSD:       map[string]float64{"US": 0.01},
+			SMSCountryMonthlyCapsUSD: map[string]float64{"US": 1},
+		},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	if err := processor.DeliverNotification(context.Background(), messageID); err != nil {
+		t.Fatal(err)
+	}
+	if repository.beginCount != 1 || repository.smsSendCount != 1 || repository.smsComplete != 1 {
+		t.Fatalf("waterfall attempts: email=%d SMS=%d completed=%d",
+			repository.beginCount, repository.smsSendCount, repository.smsComplete)
+	}
+}
+
+func TestExplicitRoutingFansOutToBothChannels(t *testing.T) {
+	messageID, accountID := uuid.New(), uuid.New()
+	material, err := emaildomain.GenerateKeyMaterial()
+	if err != nil {
+		t.Fatal(err)
+	}
+	encryptionKey := make([]byte, 32)
+	for i := range encryptionKey {
+		encryptionKey[i] = 4
+	}
+	ciphertext, err := emaildomain.EncryptPrivateKey(encryptionKey, material.PrivatePEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := &fakeRepository{
+		job: store.EmailJob{
+			ID: messageID, AccountID: accountID, Channels: []string{"email", "sms"},
+			Recipient: "person@example.net", Subject: "Hello", Body: "World",
+		},
+		dkimKey: store.DKIMKey{Selector: material.Selector, EncryptedPrivateKey: ciphertext},
+		smsJob: store.SMSJob{
+			ID: messageID, AccountID: accountID, Channels: []string{"email", "sms"},
+			Recipient: "+14155552671", Body: "Hello",
+		},
+		smsConsent: true,
+	}
+	processor := NewProcessor(
+		repository, &fakeTransport{}, &fakeSMSTransport{},
+		config.Config{
+			EmailFrom:                "notifications@example.org",
+			DKIMEncryptionKey:        encryptionKey,
+			SMSTransport:             "twilio",
+			SMSRateLimitPerMinute:    10,
+			SMSCountryRatesUSD:       map[string]float64{"US": 0.01},
+			SMSCountryMonthlyCapsUSD: map[string]float64{"US": 1},
+		},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	if err := processor.DeliverNotification(context.Background(), messageID); err != nil {
+		t.Fatal(err)
+	}
+	if repository.beginCount != 1 || repository.smsSendCount != 1 || repository.completeCount != 1 ||
+		repository.smsComplete != 1 {
+		t.Fatalf("fan-out attempts: email=%d/%d SMS=%d/%d",
+			repository.beginCount, repository.completeCount, repository.smsSendCount, repository.smsComplete)
+	}
+}
+
+func TestFanoutFailureOnOneChannelDoesNotBlockOtherChannel(t *testing.T) {
+	messageID, accountID := uuid.New(), uuid.New()
+	repository := &fakeRepository{
+		job: store.EmailJob{
+			ID: messageID, AccountID: accountID, Channels: []string{"email", "sms"},
+			Recipient: "person@example.net",
+		},
+		smsJob: store.SMSJob{
+			ID: messageID, AccountID: accountID, Channels: []string{"email", "sms"},
+			Recipient: "+14155552671", Body: "Hello",
+		},
+		suppressed: true,
+		smsConsent: true,
+	}
+	processor := NewProcessor(
+		repository, &fakeTransport{}, &fakeSMSTransport{},
+		config.Config{
+			SMSTransport:             "twilio",
+			SMSRateLimitPerMinute:    10,
+			SMSCountryRatesUSD:       map[string]float64{"US": 0.01},
+			SMSCountryMonthlyCapsUSD: map[string]float64{"US": 1},
+		},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	if err := processor.DeliverNotification(context.Background(), messageID); err != nil {
+		t.Fatal(err)
+	}
+	if repository.smsSendCount != 1 || repository.failureWebhookCount != 0 ||
+		len(repository.channelFailures) != 1 || repository.channelFailures[0] != "email" {
+		t.Fatalf("channel isolation failed: sends=%d failures=%v terminal_webhooks=%d",
+			repository.smsSendCount, repository.channelFailures, repository.failureWebhookCount)
 	}
 }
 

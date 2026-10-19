@@ -20,6 +20,7 @@ type Config struct {
 	AsynqQueue                string
 	LogLevel                  slog.Level
 	DKIMEncryptionKey         []byte
+	WebhookEncryptionKey      []byte
 	SendGridWebhookPublicKey  string
 	EmailTransport            string
 	EmailFrom                 string
@@ -61,6 +62,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	webhookEncryptionKey, err := decodeOptionalBase64("WEBHOOK_ENCRYPTION_KEY", os.Getenv("WEBHOOK_ENCRYPTION_KEY"))
+	if err != nil {
+		return Config{}, err
+	}
 	smtpPort, err := strconv.Atoi(env("SMTP_PORT", "2525"))
 	if err != nil || smtpPort < 1 || smtpPort > 65535 {
 		return Config{}, fmt.Errorf("SMTP_PORT must be an integer between 1 and 65535")
@@ -83,13 +88,14 @@ func Load() (Config, error) {
 	}
 
 	cfg := Config{
-		HTTPPort:          port,
-		DatabaseURL:       strings.TrimSpace(os.Getenv("DATABASE_URL")),
-		RedisURL:          strings.TrimSpace(os.Getenv("REDIS_URL")),
-		AccountID:         strings.TrimSpace(os.Getenv("ACCOUNT_ID")),
-		AsynqQueue:        env("ASYNQ_QUEUE", "notifications"),
-		LogLevel:          level,
-		DKIMEncryptionKey: encryptionKey,
+		HTTPPort:             port,
+		DatabaseURL:          strings.TrimSpace(os.Getenv("DATABASE_URL")),
+		RedisURL:             strings.TrimSpace(os.Getenv("REDIS_URL")),
+		AccountID:            strings.TrimSpace(os.Getenv("ACCOUNT_ID")),
+		AsynqQueue:           env("ASYNQ_QUEUE", "notifications"),
+		LogLevel:             level,
+		DKIMEncryptionKey:    encryptionKey,
+		WebhookEncryptionKey: webhookEncryptionKey,
 		SendGridWebhookPublicKey: strings.ReplaceAll(
 			strings.TrimSpace(os.Getenv("SENDGRID_WEBHOOK_PUBLIC_KEY")), `\n`, "\n",
 		),

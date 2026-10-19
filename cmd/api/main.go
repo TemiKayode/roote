@@ -55,7 +55,7 @@ func run() error {
 
 	server := &http.Server{
 		Addr: fmt.Sprintf(":%d", cfg.HTTPPort),
-		Handler: httpapi.NewWithFeatures(logger, cfg.AccountID, database, httpapi.EmailFeatures{
+		Handler: httpapi.NewWithAllFeatures(logger, cfg.AccountID, database, httpapi.EmailFeatures{
 			DomainStore:   database,
 			EncryptionKey: cfg.DKIMEncryptionKey,
 			SPFValue:      cfg.EmailSPFValue,
@@ -73,6 +73,9 @@ func run() error {
 			EnqueueStopConfirmation: func(ctx context.Context, provider, phone, eventID string) error {
 				return queue.EnqueueSMSStopConfirmation(ctx, queueClient, cfg.AsynqQueue, provider, phone, eventID)
 			},
+		}, httpapi.CustomerWebhookFeatures{
+			Store:         database,
+			EncryptionKey: cfg.WebhookEncryptionKey,
 		}),
 		ReadHeaderTimeout: 5 * time.Second,
 	}

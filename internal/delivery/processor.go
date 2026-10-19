@@ -26,7 +26,8 @@ type Repository interface {
 	GetEmailJob(context.Context, uuid.UUID) (store.EmailJob, error)
 	GetDKIMKey(context.Context, uuid.UUID, string) (store.DKIMKey, error)
 	IsEmailSuppressed(context.Context, uuid.UUID, string) (bool, error)
-	BeginEmailDelivery(context.Context, store.EmailJob, string) error
+	IsNotificationPreferred(context.Context, uuid.UUID, string, string) (bool, error)
+	BeginEmailDelivery(context.Context, store.EmailJob, string) (bool, error)
 	CompleteEmailDelivery(context.Context, uuid.UUID, string) error
 	FailEmailDelivery(context.Context, uuid.UUID, error) error
 	GetSMSJob(context.Context, uuid.UUID) (store.SMSJob, error)
@@ -37,6 +38,9 @@ type Repository interface {
 	BeginSMSDelivery(context.Context, store.SMSJob, string, string, float64) (bool, error)
 	CompleteSMSDelivery(context.Context, uuid.UUID, string) error
 	FailSMSDelivery(context.Context, uuid.UUID, error) error
+	RecordChannelFailure(context.Context, uuid.UUID, string, string) error
+	RecordChannelSkipped(context.Context, uuid.UUID, string) error
+	EmitNotificationFailure(context.Context, uuid.UUID) error
 	ReserveSMSConfirmationBudget(context.Context, string, uuid.UUID, string, float64, float64, int) error
 	ReleaseSMSConfirmationBudget(context.Context, string) error
 	MarkMessageFailed(context.Context, uuid.UUID, string) error
@@ -84,46 +88,181 @@ func (p *Processor) VerifyDomain(ctx context.Context, accountID string, domainID
 }
 
 func (p *Processor) DeliverNotification(ctx context.Context, messageID uuid.UUID) error {
-	job, err := p.repository.GetEmailJob(ctx, messageID)
-	if err != nil {
-		smsJob, smsErr := p.repository.GetSMSJob(ctx, messageID)
-		if smsErr == nil && contains(smsJob.Channels, "sms") && !contains(smsJob.Channels, "email") {
-			return p.DeliverSMS(ctx, messageID)
-		}
-		return fmt.Errorf("load notification for delivery: %w", err)
+	emailJob, emailErr := p.repository.GetEmailJob(ctx, messageID)
+	smsJob, smsErr := p.repository.GetSMSJob(ctx, messageID)
+	if emailErr != nil && smsErr != nil {
+		return fmt.Errorf("load notification for delivery: %w", errors.Join(emailErr, smsErr))
 	}
-	if contains(job.Channels, "sms") {
-		return p.failPermanently(ctx, messageID, "mixed-channel delivery requires orchestration and is not yet available")
+	if emailErr != nil && contains(smsJob.Channels, "email") {
+		return fmt.Errorf("load email notification data: %w", emailErr)
 	}
-	if !contains(job.Channels, "email") {
+	if smsErr != nil && contains(emailJob.Channels, "sms") {
+		return fmt.Errorf("load SMS notification data: %w", smsErr)
+	}
+	channels := emailJob.Channels
+	if len(channels) == 0 {
+		channels = smsJob.Channels
+	}
+	if !contains(channels, "email") && !contains(channels, "sms") {
 		return p.failPermanently(ctx, messageID, "notification has no supported delivery channel")
 	}
+	routing := emailJob.Routing
+	if emailErr != nil {
+		routing = smsJob.Routing
+	}
+	strategy := routing.Strategy
+	if strategy == "" {
+		strategy = "explicit"
+	}
+	selectedChannels := append([]string(nil), channels...)
+	if strategy == "preference" {
+		selectedChannels = selectedChannels[:0]
+		for _, channel := range channels {
+			recipient := emailJob.Recipient
+			if channel == "sms" {
+				recipient = smsJob.Recipient
+			}
+			preferred, err := p.repository.IsNotificationPreferred(ctx, smsJob.AccountID, recipient, channel)
+			if err != nil {
+				return fmt.Errorf("check %s notification preference: %w", channel, err)
+			}
+			if preferred {
+				selectedChannels = append(selectedChannels, channel)
+			}
+		}
+		if len(selectedChannels) == 0 {
+			for _, channel := range channels {
+				if err := p.repository.RecordChannelFailure(
+					ctx, messageID, channel, "channel is disabled in recipient preferences",
+				); err != nil {
+					return err
+				}
+			}
+			return p.finalizeChannelError(ctx, messageID, fmt.Errorf(
+				"%w: no requested notification channel is enabled in recipient preferences", asynq.SkipRetry,
+			))
+		}
+		selected := make(map[string]struct{}, len(selectedChannels))
+		for _, channel := range selectedChannels {
+			selected[channel] = struct{}{}
+		}
+		for _, channel := range channels {
+			if _, enabled := selected[channel]; !enabled {
+				if err := p.repository.RecordChannelSkipped(ctx, messageID, channel); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	if strategy == "waterfall" {
+		ordered := routing.Order
+		if len(ordered) == 0 {
+			ordered = channels
+		}
+		var failures []error
+		for _, channel := range ordered {
+			err := p.deliverChannel(ctx, channel, messageID, emailJob)
+			if err == nil {
+				return nil
+			}
+			failures = append(failures, fmt.Errorf("%s delivery: %w", channel, err))
+		}
+		return p.finalizeChannelError(ctx, messageID, aggregateChannelErrors(failures))
+	}
+	if len(selectedChannels) == 1 {
+		return p.finalizeChannelError(ctx, messageID, p.deliverChannel(ctx, selectedChannels[0], messageID, emailJob))
+	}
+	results := make(chan error, len(selectedChannels))
+	for _, channel := range selectedChannels {
+		channel := channel
+		go func() { results <- p.deliverChannel(ctx, channel, messageID, emailJob) }()
+	}
+	var failures []error
+	successes := 0
+	for range selectedChannels {
+		if err := <-results; err != nil {
+			failures = append(failures, err)
+		} else {
+			successes++
+		}
+	}
+	if len(failures) > 0 {
+		aggregated := aggregateChannelErrors(failures)
+		if successes > 0 && errors.Is(aggregated, asynq.SkipRetry) {
+			return nil
+		}
+		return p.finalizeChannelError(ctx, messageID, aggregated)
+	}
+	return nil
+}
+
+func (p *Processor) finalizeChannelError(ctx context.Context, messageID uuid.UUID, err error) error {
+	if err == nil || !errors.Is(err, asynq.SkipRetry) {
+		return err
+	}
+	if recordErr := p.repository.EmitNotificationFailure(ctx, messageID); recordErr != nil {
+		return fmt.Errorf("record terminal notification failure: %w", recordErr)
+	}
+	return err
+}
+
+func aggregateChannelErrors(failures []error) error {
+	var retryable []error
+	for _, err := range failures {
+		if !errors.Is(err, asynq.SkipRetry) {
+			retryable = append(retryable, err)
+		}
+	}
+	if len(retryable) > 0 {
+		return fmt.Errorf("one or more notification channels failed: %w", errors.Join(retryable...))
+	}
+	return fmt.Errorf("%w: all requested notification channels failed: %v",
+		asynq.SkipRetry, errors.Join(failures...))
+}
+
+func (p *Processor) deliverChannel(
+	ctx context.Context,
+	channel string,
+	messageID uuid.UUID,
+	emailJob store.EmailJob,
+) error {
+	switch channel {
+	case "email":
+		return p.deliverEmail(ctx, emailJob)
+	case "sms":
+		return p.DeliverSMS(ctx, messageID)
+	default:
+		return p.failPermanently(ctx, messageID, "notification has no supported delivery channel")
+	}
+}
+
+func (p *Processor) deliverEmail(ctx context.Context, job store.EmailJob) error {
+	messageID := job.ID
 	if p.transport == nil {
-		return p.failPermanently(ctx, messageID, "email transport is disabled; configure EMAIL_TRANSPORT")
+		return p.failChannelPermanently(ctx, messageID, "email", "email transport is disabled; configure EMAIL_TRANSPORT")
 	}
 	suppressed, err := p.repository.IsEmailSuppressed(ctx, job.AccountID, job.Recipient)
 	if err != nil {
 		return fmt.Errorf("check recipient suppression: %w", err)
 	}
 	if suppressed {
-		return p.failPermanently(ctx, messageID, "recipient is suppressed for email")
+		return p.failChannelPermanently(ctx, messageID, "email", "recipient is suppressed for email")
 	}
-
 	from, err := mail.ParseAddress(p.config.EmailFrom)
 	if err != nil {
-		return p.failPermanently(ctx, messageID, "configured EMAIL_FROM is invalid")
+		return p.failChannelPermanently(ctx, messageID, "email", "configured EMAIL_FROM is invalid")
 	}
 	parts := strings.Split(from.Address, "@")
 	if len(parts) != 2 {
-		return p.failPermanently(ctx, messageID, "configured EMAIL_FROM has no domain")
+		return p.failChannelPermanently(ctx, messageID, "email", "configured EMAIL_FROM has no domain")
 	}
 	dkimKey, err := p.repository.GetDKIMKey(ctx, job.AccountID, strings.ToLower(parts[1]))
 	if err != nil {
-		return p.failPermanently(ctx, messageID, "sender domain has not been verified")
+		return p.failChannelPermanently(ctx, messageID, "email", "sender domain has not been verified")
 	}
 	privateKeyPEM, err := emaildomain.DecryptPrivateKey(p.config.DKIMEncryptionKey, dkimKey.EncryptedPrivateKey)
 	if err != nil {
-		return p.failPermanently(ctx, messageID, "could not decrypt sender DKIM key")
+		return p.failChannelPermanently(ctx, messageID, "email", "could not decrypt sender DKIM key")
 	}
 	if job.TrafficClass == "" {
 		job.TrafficClass = "transactional"
@@ -133,10 +272,14 @@ func (p *Processor) DeliverNotification(ctx context.Context, messageID uuid.UUID
 		job.TrafficClass, p.config.MarketingUnsubscribeURL, dkimKey.Selector, privateKeyPEM,
 	)
 	if err != nil {
-		return p.failPermanently(ctx, messageID, err.Error())
+		return p.failChannelPermanently(ctx, messageID, "email", err.Error())
 	}
-	if err := p.repository.BeginEmailDelivery(ctx, job, p.transport.Provider()); err != nil {
+	shouldSend, err := p.repository.BeginEmailDelivery(ctx, job, p.transport.Provider())
+	if err != nil {
 		return err
+	}
+	if !shouldSend {
+		return nil
 	}
 	providerMessageID, err := p.transport.Send(ctx, message)
 	if err != nil {
@@ -169,20 +312,20 @@ func (p *Processor) DeliverSMS(ctx context.Context, messageID uuid.UUID) error {
 		return fmt.Errorf("load notification for SMS delivery: %w", err)
 	}
 	if !contains(job.Channels, "sms") {
-		return p.failPermanently(ctx, messageID, "notification does not request SMS")
+		return p.failChannelPermanently(ctx, messageID, "sms", "notification does not request SMS")
 	}
 	if p.smsTransport == nil {
-		return p.failPermanently(ctx, messageID, "SMS transport is disabled; configure SMS_TRANSPORT")
+		return p.failChannelPermanently(ctx, messageID, "sms", "SMS transport is disabled; configure SMS_TRANSPORT")
 	}
 	countryNumber, err := phonenumbers.Parse(job.Recipient, "")
 	if err != nil || !phonenumbers.IsValidNumber(countryNumber) {
-		return p.failPermanently(ctx, messageID, "recipient phone number is invalid")
+		return p.failChannelPermanently(ctx, messageID, "sms", "recipient phone number is invalid")
 	}
 	countryCode := phonenumbers.GetRegionCodeForNumber(countryNumber)
 	rate, hasRate := p.config.SMSCountryRatesUSD[countryCode]
 	budget, hasBudget := p.config.SMSCountryMonthlyCapsUSD[countryCode]
 	if !hasRate || !hasBudget {
-		return p.failPermanently(ctx, messageID, "SMS country pricing and monthly budget are not configured")
+		return p.failChannelPermanently(ctx, messageID, "sms", "SMS country pricing and monthly budget are not configured")
 	}
 	trafficClass := job.TrafficClass
 	if trafficClass == "" {
@@ -193,14 +336,14 @@ func (p *Processor) DeliverSMS(ctx context.Context, messageID uuid.UUID) error {
 		return fmt.Errorf("check SMS consent: %w", err)
 	}
 	if !consented {
-		return p.failPermanently(ctx, messageID, "active SMS consent is required")
+		return p.failChannelPermanently(ctx, messageID, "sms", "active SMS consent is required")
 	}
 	suppressed, err := p.repository.IsSMSSuppressed(ctx, job.AccountID, job.Recipient)
 	if err != nil {
 		return fmt.Errorf("check SMS suppression: %w", err)
 	}
 	if suppressed {
-		return p.failPermanently(ctx, messageID, "recipient is suppressed for SMS")
+		return p.failChannelPermanently(ctx, messageID, "sms", "recipient is suppressed for SMS")
 	}
 	segments := sms.SegmentCount(job.Body)
 	estimatedCost := float64(segments) * rate
@@ -211,7 +354,7 @@ func (p *Processor) DeliverSMS(ctx context.Context, messageID uuid.UUID) error {
 			return fmt.Errorf("reserve SMS rate limit: %w", err)
 		}
 		if errors.Is(err, store.ErrSMSCountryBudget) {
-			return p.failPermanently(ctx, messageID, err.Error())
+			return p.failChannelPermanently(ctx, messageID, "sms", err.Error())
 		}
 		return fmt.Errorf("reserve SMS sending capacity: %w", err)
 	}
@@ -312,6 +455,17 @@ func (p *Processor) SendSMSStopConfirmation(
 func (p *Processor) failPermanently(ctx context.Context, messageID uuid.UUID, reason string) error {
 	if err := p.repository.MarkMessageFailed(ctx, messageID, reason); err != nil {
 		return fmt.Errorf("record permanent notification failure: %w", err)
+	}
+	return fmt.Errorf("%w: %s", asynq.SkipRetry, reason)
+}
+
+func (p *Processor) failChannelPermanently(
+	ctx context.Context,
+	messageID uuid.UUID,
+	channel, reason string,
+) error {
+	if err := p.repository.RecordChannelFailure(ctx, messageID, channel, reason); err != nil {
+		return fmt.Errorf("record permanent %s failure: %w", channel, err)
 	}
 	return fmt.Errorf("%w: %s", asynq.SkipRetry, reason)
 }

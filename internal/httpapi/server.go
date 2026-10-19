@@ -2,6 +2,8 @@ package httpapi
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -22,6 +24,7 @@ import (
 	"github.com/nyaruka/phonenumbers"
 
 	"github.com/TemiKayode/roote/internal/emaildomain"
+	securesecret "github.com/TemiKayode/roote/internal/secret"
 	"github.com/TemiKayode/roote/internal/smswebhook"
 	"github.com/TemiKayode/roote/internal/store"
 )
@@ -58,6 +61,14 @@ type SMSStore interface {
 	ProcessSMSWebhookEvent(context.Context, store.SMSWebhookEvent) (bool, error)
 }
 
+type OrchestrationStore interface {
+	SetNotificationPreference(context.Context, uuid.UUID, string, string, bool) error
+}
+
+type CustomerWebhookStore interface {
+	CreateWebhookEndpoint(context.Context, uuid.UUID, string, []byte, []string) (uuid.UUID, error)
+}
+
 type EmailFeatures struct {
 	DomainStore               DomainStore
 	EncryptionKey             []byte
@@ -76,6 +87,11 @@ type SMSFeatures struct {
 	TelnyxWebhookPublicKey  string
 }
 
+type CustomerWebhookFeatures struct {
+	Store         CustomerWebhookStore
+	EncryptionKey []byte
+}
+
 type Server struct {
 	store                      NotificationStore
 	accountID                  string
@@ -92,10 +108,13 @@ type Server struct {
 	twilioInboundWebhookURL    string
 	smsStatusCallbackURL       string
 	telnyxWebhookPublicKey     string
+	orchestrationStore         OrchestrationStore
+	webhookStore               CustomerWebhookStore
+	webhookEncryptionKey       []byte
 }
 
 func New(logger *slog.Logger, accountID string, notificationStore NotificationStore) *gin.Engine {
-	return NewWithEmail(logger, accountID, notificationStore, EmailFeatures{})
+	return NewWithAllFeatures(logger, accountID, notificationStore, EmailFeatures{}, SMSFeatures{}, CustomerWebhookFeatures{})
 }
 
 func NewWithEmail(
@@ -104,7 +123,7 @@ func NewWithEmail(
 	notificationStore NotificationStore,
 	emailFeatures EmailFeatures,
 ) *gin.Engine {
-	return newRouter(logger, accountID, notificationStore, emailFeatures, SMSFeatures{})
+	return newRouter(logger, accountID, notificationStore, emailFeatures, SMSFeatures{}, CustomerWebhookFeatures{})
 }
 
 func NewWithFeatures(
@@ -114,7 +133,18 @@ func NewWithFeatures(
 	emailFeatures EmailFeatures,
 	smsFeatures SMSFeatures,
 ) *gin.Engine {
-	return newRouter(logger, accountID, notificationStore, emailFeatures, smsFeatures)
+	return newRouter(logger, accountID, notificationStore, emailFeatures, smsFeatures, CustomerWebhookFeatures{})
+}
+
+func NewWithAllFeatures(
+	logger *slog.Logger,
+	accountID string,
+	notificationStore NotificationStore,
+	emailFeatures EmailFeatures,
+	smsFeatures SMSFeatures,
+	webhookFeatures CustomerWebhookFeatures,
+) *gin.Engine {
+	return newRouter(logger, accountID, notificationStore, emailFeatures, smsFeatures, webhookFeatures)
 }
 
 func newRouter(
@@ -123,6 +153,7 @@ func newRouter(
 	notificationStore NotificationStore,
 	emailFeatures EmailFeatures,
 	smsFeatures SMSFeatures,
+	webhookFeatures CustomerWebhookFeatures,
 ) *gin.Engine {
 	server := &Server{
 		store:                      notificationStore,
@@ -140,12 +171,17 @@ func newRouter(
 		twilioInboundWebhookURL:    smsFeatures.TwilioInboundWebhookURL,
 		smsStatusCallbackURL:       smsFeatures.SMSStatusCallbackURL,
 		telnyxWebhookPublicKey:     smsFeatures.TelnyxWebhookPublicKey,
+		orchestrationStore:         orchestrationStoreFrom(notificationStore),
+		webhookStore:               webhookFeatures.Store,
+		webhookEncryptionKey:       webhookFeatures.EncryptionKey,
 	}
 	router := gin.New()
 	router.Use(gin.Recovery())
 	router.GET("/healthz", server.health)
 	router.GET("/readyz", server.ready)
 	router.POST("/v1/notifications", server.createNotification)
+	router.PUT("/v1/preferences", server.setNotificationPreference)
+	router.POST("/v1/webhooks", server.createCustomerWebhook)
 	router.POST("/v1/domains", server.createDomain)
 	router.POST("/v1/domains/:id/verify", server.verifyDomain)
 	router.GET("/v1/domains/:id/records", server.domainRecords)
@@ -154,6 +190,11 @@ func newRouter(
 	router.POST("/internal/webhooks/sms/twilio", server.twilioSMSWebhook)
 	router.POST("/internal/webhooks/sms/telnyx", server.telnyxSMSWebhook)
 	return router
+}
+
+func orchestrationStoreFrom(notificationStore NotificationStore) OrchestrationStore {
+	store, _ := notificationStore.(OrchestrationStore)
+	return store
 }
 
 func (s *Server) health(c *gin.Context) {
@@ -206,6 +247,138 @@ func (s *Server) createNotification(c *gin.Context) {
 			"duplicate":  duplicate,
 		})
 	}
+}
+
+func (s *Server) setNotificationPreference(c *gin.Context) {
+	if s.orchestrationStore == nil {
+		c.JSON(http.StatusNotImplemented, gin.H{"error": "notification preferences are unavailable"})
+		return
+	}
+	var request struct {
+		Channel   string `json:"channel"`
+		Recipient string `json:"recipient"`
+		Enabled   *bool  `json:"enabled"`
+	}
+	if err := decodeJSON(c, &request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "request body must be valid JSON with supported fields only"})
+		return
+	}
+	if request.Enabled == nil || (request.Channel != "email" && request.Channel != "sms") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "channel must be email or sms and enabled must be provided"})
+		return
+	}
+	recipient := strings.TrimSpace(request.Recipient)
+	if request.Channel == "email" {
+		address, err := mail.ParseAddress(recipient)
+		if err != nil || address.Address != recipient || len(recipient) > 254 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "recipient must be a valid email address"})
+			return
+		}
+		recipient = strings.ToLower(recipient)
+	} else {
+		phone, err := parseE164(recipient)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "recipient must be a valid E.164 phone number"})
+			return
+		}
+		recipient = phone
+	}
+	accountID, err := uuid.Parse(s.accountID)
+	if err != nil {
+		s.logger.ErrorContext(c.Request.Context(), "configured account ID is invalid", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not save notification preference"})
+		return
+	}
+	if err := s.orchestrationStore.SetNotificationPreference(
+		c.Request.Context(), accountID, recipient, request.Channel, *request.Enabled,
+	); err != nil {
+		s.logger.ErrorContext(c.Request.Context(), "could not save notification preference", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not save notification preference"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"channel": request.Channel, "recipient": recipient, "enabled": *request.Enabled,
+	})
+}
+
+func (s *Server) createCustomerWebhook(c *gin.Context) {
+	if s.webhookStore == nil || len(s.webhookEncryptionKey) != 32 {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "customer webhooks require a configured 32-byte WEBHOOK_ENCRYPTION_KEY"})
+		return
+	}
+	var request struct {
+		URL    string   `json:"url"`
+		Events []string `json:"events"`
+	}
+	if err := decodeJSON(c, &request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "request body must be valid JSON with supported fields only"})
+		return
+	}
+	endpointURL := strings.TrimSpace(request.URL)
+	parsedURL, err := url.ParseRequestURI(endpointURL)
+	if err != nil || parsedURL.Scheme != "https" || parsedURL.Host == "" || parsedURL.User != nil ||
+		len(endpointURL) > 2048 || strings.EqualFold(parsedURL.Hostname(), "localhost") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "url must be an absolute HTTPS URL"})
+		return
+	}
+	if ip := net.ParseIP(parsedURL.Hostname()); ip != nil &&
+		(ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() || ip.IsMulticast()) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "url must target a public HTTPS host"})
+		return
+	}
+	allowedEvents := map[string]struct{}{
+		"notification.accepted":             {},
+		"notification.accepted_by_provider": {},
+		"notification.delivered":            {},
+		"notification.partially_delivered":  {},
+		"notification.failed":               {},
+	}
+	if len(request.Events) == 0 || len(request.Events) > len(allowedEvents) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "events must contain one or more supported notification events"})
+		return
+	}
+	seen := make(map[string]struct{}, len(request.Events))
+	for _, event := range request.Events {
+		if _, ok := allowedEvents[event]; !ok {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "events may contain only supported notification events"})
+			return
+		}
+		if _, ok := seen[event]; ok {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "events must not contain duplicates"})
+			return
+		}
+		seen[event] = struct{}{}
+	}
+	accountID, err := uuid.Parse(s.accountID)
+	if err != nil {
+		s.logger.ErrorContext(c.Request.Context(), "configured account ID is invalid", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not create customer webhook"})
+		return
+	}
+	signingSecret := make([]byte, 32)
+	if _, err := rand.Read(signingSecret); err != nil {
+		s.logger.ErrorContext(c.Request.Context(), "could not generate customer webhook secret", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not create customer webhook"})
+		return
+	}
+	encryptedSecret, err := securesecret.Encrypt(s.webhookEncryptionKey, signingSecret)
+	if err != nil {
+		s.logger.ErrorContext(c.Request.Context(), "could not encrypt customer webhook secret", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not create customer webhook"})
+		return
+	}
+	webhookID, err := s.webhookStore.CreateWebhookEndpoint(
+		c.Request.Context(), accountID, endpointURL, encryptedSecret, request.Events,
+	)
+	if err != nil {
+		s.logger.ErrorContext(c.Request.Context(), "could not create customer webhook", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not create customer webhook"})
+		return
+	}
+	c.JSON(http.StatusCreated, gin.H{
+		"id": webhookID.String(), "url": endpointURL, "events": request.Events,
+		"signing_secret": base64.RawURLEncoding.EncodeToString(signingSecret),
+	})
 }
 
 func (s *Server) recordSMSConsent(c *gin.Context) {
@@ -746,6 +919,28 @@ func validateNotification(notification store.Notification) string {
 			return "channels must not contain duplicates"
 		}
 		seenChannels[channel] = struct{}{}
+	}
+	if notification.Routing.Strategy != "" &&
+		notification.Routing.Strategy != "explicit" &&
+		notification.Routing.Strategy != "preference" &&
+		notification.Routing.Strategy != "waterfall" {
+		return "routing.strategy must be explicit, preference, or waterfall"
+	}
+	if len(notification.Routing.Order) > 0 {
+		if notification.Routing.Strategy != "waterfall" ||
+			len(notification.Routing.Order) != len(notification.Channels) {
+			return "routing.order must list each requested channel for waterfall routing"
+		}
+		seenOrder := make(map[string]struct{}, len(notification.Routing.Order))
+		for _, channel := range notification.Routing.Order {
+			if _, requested := seenChannels[channel]; !requested {
+				return "routing.order may contain only requested channels"
+			}
+			if _, duplicate := seenOrder[channel]; duplicate {
+				return "routing.order must not contain duplicates"
+			}
+			seenOrder[channel] = struct{}{}
+		}
 	}
 	if strings.TrimSpace(notification.Content.Body) == "" || len(notification.Content.Body) > 100_000 {
 		return "content.body must be non-empty and at most 100000 bytes"

@@ -17,6 +17,7 @@ import (
 	"github.com/TemiKayode/roote/internal/store"
 	"github.com/TemiKayode/roote/internal/transport/email"
 	"github.com/TemiKayode/roote/internal/transport/sms"
+	"github.com/TemiKayode/roote/internal/webhook"
 )
 
 func main() {
@@ -50,6 +51,8 @@ func run() error {
 		return fmt.Errorf("configure SMS transport: %w", err)
 	}
 	processor := delivery.NewProcessor(database, emailTransport, smsTransport, cfg, logger)
+	webhookSender := webhook.NewSender(cfg.WebhookEncryptionKey)
+	webhookHandler := webhook.NewHandler(database, webhookSender)
 
 	redis := asynq.RedisClientOpt{Addr: cfg.RedisURL}
 	client := asynq.NewClient(redis)
@@ -59,12 +62,23 @@ func run() error {
 		Logger: slogAsynqLogger{logger: logger},
 	})
 	if err := server.Start(queue.NewServeMux(
-		logger, processor.DeliverNotification, processor.VerifyDomain, processor.SendSMSStopConfirmation,
+		logger,
+		processor.DeliverNotification,
+		processor.VerifyDomain,
+		processor.SendSMSStopConfirmation,
+		func(ctx context.Context, deliveryID uuid.UUID) error {
+			retries, _ := asynq.GetRetryCount(ctx)
+			maxRetries, _ := asynq.GetMaxRetry(ctx)
+			return webhookHandler.Handle(ctx, deliveryID, retries, maxRetries)
+		},
 	)); err != nil {
 		return fmt.Errorf("start Asynq server: %w", err)
 	}
 	go database.RunOutboxRelay(ctx, func(ctx context.Context, messageID uuid.UUID) error {
 		return queue.EnqueueNotification(ctx, client, cfg.AsynqQueue, messageID)
+	}, logger)
+	go database.RunWebhookRelay(ctx, func(ctx context.Context, deliveryID uuid.UUID) error {
+		return queue.EnqueueWebhookDelivery(ctx, client, cfg.AsynqQueue, deliveryID)
 	}, logger)
 
 	logger.Info("worker started", "queue", cfg.AsynqQueue)

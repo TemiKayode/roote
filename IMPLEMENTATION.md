@@ -51,11 +51,12 @@ Acceptance: a valid request receives `202` and a stable message ID; replaying th
 
 ### Milestone 4 — Orchestration and customer webhooks
 
-- Add explicit, preference-based, and waterfall routing with channel-specific preferences and suppression checks.
-- Persist each attempt and state transition; make waterfall decisions queryable.
-- Use bounded parallelism for fan-out and controlled fallback for failures/timeouts.
-- Sign outbound webhook payloads with HMAC-SHA256 and retry delivery through Asynq.
-- Test routing matrices, fallback, retries, and isolation between email and SMS consent/suppression.
+- [x] Add explicit, preference-based, and waterfall routing with channel-specific preferences and suppression checks.
+- [x] Persist channel attempts and reconcile accepted, delivered, failed, skipped, and partially delivered states.
+- [x] Fan out to at most the two supported channels concurrently; waterfall routes attempt channels in order and fall back after synchronous provider failures.
+- [x] Add HTTPS customer webhook registration, encrypted signing secrets, HMAC-SHA256 signatures, durable delivery records, and Asynq retries.
+- [x] Test route selection, fan-out, fallback, preference handling, URL restrictions, signatures, encryption, and webhook persistence.
+- [x] Apply migration 4 and verify the local Compose API/worker lifecycle.
 
 ### Milestone 5 — Operations, compliance, and hardening
 
@@ -69,11 +70,11 @@ Acceptance: a valid request receives `202` and a stable message ID; replaying th
 
 1. Install Go 1.24+ and Docker Desktop with Compose.
 2. From the repository root, copy `.env.example` to `.env`. Keep `.env` out of version control; `.gitignore` already excludes it.
-3. Generate a persistent 32-byte DKIM encryption key and set `DKIM_ENCRYPTION_KEY` to its standard-base64 encoding. Protect and back it up: losing it makes stored DKIM private keys undecryptable.
+3. Generate persistent 32-byte keys and set `DKIM_ENCRYPTION_KEY` and `WEBHOOK_ENCRYPTION_KEY` to their standard-base64 encodings. The webhook key is required to register outbound customer webhook endpoints. Protect and back up both keys: losing either makes stored secrets undecryptable.
 4. For actual email delivery, configure `EMAIL_TRANSPORT`, `EMAIL_FROM`, and the corresponding provider credentials. `EMAIL_TRANSPORT=disabled` is the local default; queued email tasks will be marked failed rather than silently reported as delivered.
 5. For SendGrid, configure domain authentication in SendGrid as well as publishing the service's DNS records. SendGrid signs the HTTP-submitted message with its provider-managed key; the generated key is used for SMTP delivery. Set `SENDGRID_WEBHOOK_PUBLIC_KEY` to the Event Webhook verification key to enable signed bounce/complaint callbacks. Set `EMAIL_SPF_VALUE` to the SPF value appropriate for the selected delivery path.
 6. To enable SMS, set `SMS_TRANSPORT` to `twilio` or `telnyx`, set `SMS_FROM` and `SMS_STATUS_CALLBACK_URL`, and provide the corresponding provider credentials. Twilio additionally needs `TWILIO_INBOUND_WEBHOOK_URL`; Telnyx needs `TELNYX_WEBHOOK_PUBLIC_KEY`. Configure both `SMS_COUNTRY_RATES_USD` and `SMS_COUNTRY_MONTHLY_CAPS_USD` as comma-separated `ISO=amount` pairs (for example, `US=0.01,GB=0.05`). Rates are estimated USD per SMS segment; budgets reserve that estimate for the current UTC month. The account send limit is a fixed per-minute window. Unconfigured destination countries fail closed.
-7. Configure the provider's inbound webhook to `/internal/webhooks/sms/twilio` or `/internal/webhooks/sms/telnyx`. Twilio status callbacks are generated from `SMS_STATUS_CALLBACK_URL`; set it to the matching public Twilio webhook endpoint. Telnyx delivery callbacks use that URL from each send request. Do not expose the API until customer authentication and webhook exposure controls are implemented.
+7. Configure the provider's inbound webhook to `/internal/webhooks/sms/twilio` or `/internal/webhooks/sms/telnyx`. Twilio status callbacks are generated from `SMS_STATUS_CALLBACK_URL`; set it to the matching public Twilio webhook endpoint. Telnyx delivery callbacks use that URL from each send request. Do not expose the API until customer authentication is implemented.
 8. Before sending SMS, record the recipient's explicit consent:
 
    ```powershell
@@ -88,9 +89,39 @@ Acceptance: a valid request receives `202` and a stable message ID; replaying th
    ```
 
    Use `scope = "marketing"` for marketing permission or `scope = "all"` only when the captured consent explicitly covers both. `consented = false` withdraws consent and adds an SMS suppression. Inbound STOP, STOPALL, UNSUBSCRIBE, CANCEL, END, QUIT, and REVOKE commands withdraw all SMS scopes and queue a confirmation.
-9. Start services with `docker compose up --build`.
-10. Check `http://localhost:8080/healthz` and `http://localhost:8080/readyz`.
-11. Register a domain and publish the returned records:
+
+9. Configure channel preferences with `PUT /v1/preferences`:
+
+   ```powershell
+   $preference = @{
+     channel = "email"
+     recipient = "person@example.com"
+     enabled = $true
+   } | ConvertTo-Json
+   Invoke-RestMethod -Method Put -Uri "http://localhost:8080/v1/preferences" `
+     -ContentType "application/json" -Body $preference
+   ```
+
+   Preferences are recipient- and channel-specific. They do not override suppression or consent checks. Use `routing.strategy = "preference"` in a notification to dispatch only through enabled requested channels. `explicit` (the default) fans out to the requested channels concurrently. `waterfall` tries requested channels in the supplied `routing.order`, falling back after a synchronous provider failure; it does not retry after a provider has accepted the message.
+
+10. Register an outbound customer webhook. A 32-byte signing secret is returned once; save it securely. The payload bytes are signed as HMAC-SHA256 over `timestamp + "." + raw_body`, with `X-Roote-Timestamp` and `X-Roote-Signature: sha256=<hex>` headers. Only HTTPS endpoints are accepted, redirects are not followed, and outbound connections to non-public IP addresses are blocked.
+
+   ```powershell
+   $webhook = @{
+     url = "https://hooks.example.com/notifications"
+     events = @("notification.accepted", "notification.accepted_by_provider",
+                "notification.delivered", "notification.partially_delivered",
+                "notification.failed")
+   } | ConvertTo-Json
+   Invoke-RestMethod -Method Post -Uri "http://localhost:8080/v1/webhooks" `
+     -ContentType "application/json" -Body $webhook
+   ```
+
+   Webhook attempts are persisted and retried by Asynq (up to eight retries). Endpoint registration is not authenticated in this development milestone; do not expose it publicly.
+
+11. Start services with `docker compose up --build`.
+12. Check `http://localhost:8080/healthz` and `http://localhost:8080/readyz`.
+13. Register a domain and publish the returned records:
 
    ```powershell
    Invoke-RestMethod -Method Post -Uri "http://localhost:8080/v1/domains" `
@@ -99,7 +130,7 @@ Acceptance: a valid request receives `202` and a stable message ID; replaying th
 
    Merge the SPF mechanism into an existing SPF record, if present; do not publish multiple SPF or DMARC TXT records for the same owner name. After DNS has propagated, trigger verification with `POST /v1/domains/{id}/verify`; retries run in the worker.
 
-12. Submit a transactional email request:
+14. Submit a transactional email request:
 
    ```powershell
    $headers = @{
@@ -116,18 +147,18 @@ Acceptance: a valid request receives `202` and a stable message ID; replaying th
    Invoke-RestMethod -Method Post -Uri "http://localhost:8080/v1/notifications" -Headers $headers -Body $body
    ```
 
-13. Repeat with the same key and payload (same message ID), then change the payload but keep the key (HTTP 409).
-14. Watch `docker compose logs -f worker` and check the `email_deliveries` / `sms_deliveries` tables: provider acceptance is not final delivery; signed callbacks update delivery state.
-15. Run local checks with `go test ./...` and `go vet ./...`. To run the PostgreSQL-backed SMS consent, cap, rate-limit, receipt, and STOP lifecycle test, set `TEST_DATABASE_URL` to a disposable PostgreSQL database and run `go test ./internal/store -run '^TestSMSStoreControlsAndWebhooks$' -count=1`.
-16. Stop the stack with `docker compose down`. PostgreSQL data is persisted in a named volume; removing it is destructive and is not part of routine shutdown.
+15. Repeat with the same key and payload (same message ID), then change the payload but keep the key (HTTP 409).
+16. Watch `docker compose logs -f worker` and inspect `delivery_attempts`, `email_deliveries`, `sms_deliveries`, and `webhook_deliveries`. Provider acceptance is not final delivery; signed provider callbacks update delivery state.
+17. Run local checks with `go test ./...` and `go vet ./...`. PostgreSQL-backed SMS and orchestration/webhook store lifecycle tests require `TEST_DATABASE_URL` pointing at a disposable PostgreSQL database; run `go test ./internal/store -count=1`.
+18. Stop the stack with `docker compose down`. PostgreSQL data is persisted in a named volume; removing it is destructive and is not part of routine shutdown.
 
 ## Current limitations and next decisions
 
 - The development account ID is configured through `ACCOUNT_ID`; authentication and tenant isolation must be implemented before exposing this service publicly.
-- Email-only and SMS-only notifications are delivered in Milestones 2 and 3. Mixed-channel requests remain explicitly unavailable until orchestration in Milestone 4.
-- Customer authentication, tenant authorization, durable public webhook ingress, and outbound customer webhooks remain future milestones. Consent submitted through the development API is not independently verified; integrate authenticated consent capture before production.
+- Email-only, SMS-only, and mixed-channel requests are supported. A provider's later delivery failure does not trigger waterfall fallback after that provider has already accepted the message.
+- Customer authentication and tenant authorization remain future work. Preference, consent, and webhook endpoint APIs currently use the configured development account and must not be exposed publicly. Consent submitted through the development API is not independently verified; integrate authenticated consent capture before production.
 - SMS country prices are operator-provided estimates and budget reservations, not reconciled provider invoices. Update rates and caps whenever provider pricing changes; current-period estimates should be reconciled operationally.
 - The SMTP adapter signs messages with the stored DKIM key. For SendGrid, configure SendGrid's own domain authentication records; provider signing is not performed with the private key stored here.
 - Exactly-once delivery cannot be guaranteed across a provider acceptance followed by a process crash before PostgreSQL records the response. Providers may accept a retry as a duplicate; this remains an at-least-once system.
 - Configure secrets from a secret manager in deployed environments; never reuse `.env.example` credentials.
-- Before production, choose the product/module path, deployment region/provider, retention policy, and key-management approach.
+- Before production, choose deployment region/provider, retention policy, and managed key-rotation/recovery procedures.

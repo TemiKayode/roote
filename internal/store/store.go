@@ -39,6 +39,7 @@ type Notification struct {
 	Event        string   `json:"event"`
 	Channels     []string `json:"channels"`
 	TrafficClass string   `json:"traffic_class,omitempty"`
+	Routing      Routing  `json:"routing,omitempty"`
 	Recipient    struct {
 		Email string `json:"email,omitempty"`
 		Phone string `json:"phone,omitempty"`
@@ -47,6 +48,28 @@ type Notification struct {
 		Subject string `json:"subject,omitempty"`
 		Body    string `json:"body"`
 	} `json:"content"`
+}
+
+type Routing struct {
+	Strategy string   `json:"strategy,omitempty"`
+	Order    []string `json:"order,omitempty"`
+}
+
+type WebhookEndpoint struct {
+	ID               uuid.UUID
+	AccountID        uuid.UUID
+	URL              string
+	EncryptedSecret  []byte
+	SubscribedEvents []string
+	Active           bool
+}
+
+type WebhookDelivery struct {
+	ID              uuid.UUID
+	URL             string
+	EncryptedSecret []byte
+	EventType       string
+	Payload         []byte
 }
 
 type Domain struct {
@@ -69,6 +92,7 @@ type EmailJob struct {
 	Subject      string
 	Body         string
 	TrafficClass string
+	Routing      Routing
 }
 
 type SMSJob struct {
@@ -78,6 +102,7 @@ type SMSJob struct {
 	Recipient    string
 	Body         string
 	TrafficClass string
+	Routing      Routing
 }
 
 type DKIMKey struct {
@@ -289,7 +314,221 @@ func (s *Store) GetSMSJob(ctx context.Context, messageID uuid.UUID) (SMSJob, err
 	job.Recipient = notification.Recipient.Phone
 	job.Body = notification.Content.Body
 	job.TrafficClass = notification.TrafficClass
+	job.Routing = notification.Routing
 	return job, nil
+}
+
+func (s *Store) SetNotificationPreference(
+	ctx context.Context,
+	accountID uuid.UUID,
+	recipient, channel string,
+	enabled bool,
+) error {
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO notification_preferences (account_id, recipient, channel, enabled)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (account_id, recipient, channel) DO UPDATE
+		SET enabled = EXCLUDED.enabled, updated_at = now()`,
+		accountID, recipient, channel, enabled,
+	)
+	if err != nil {
+		return fmt.Errorf("save notification preference: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) IsNotificationPreferred(
+	ctx context.Context,
+	accountID uuid.UUID,
+	recipient, channel string,
+) (bool, error) {
+	var enabled bool
+	err := s.pool.QueryRow(ctx, `
+		SELECT COALESCE((
+			SELECT enabled FROM notification_preferences
+			WHERE account_id = $1 AND lower(recipient) = lower($2) AND channel = $3
+			ORDER BY updated_at DESC LIMIT 1
+		), false)`, accountID, recipient, channel,
+	).Scan(&enabled)
+	if err != nil {
+		return false, fmt.Errorf("load notification preference: %w", err)
+	}
+	return enabled, nil
+}
+
+func (s *Store) CreateWebhookEndpoint(
+	ctx context.Context,
+	accountID uuid.UUID,
+	endpointURL string,
+	encryptedSecret []byte,
+	events []string,
+) (uuid.UUID, error) {
+	var id uuid.UUID
+	err := s.pool.QueryRow(ctx, `
+		INSERT INTO webhook_endpoints (account_id, endpoint_url, secret_ciphertext, subscribed_events)
+		VALUES ($1, $2, $3, $4)
+		RETURNING id`, accountID, endpointURL, encryptedSecret, events,
+	).Scan(&id)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("create customer webhook endpoint: %w", err)
+	}
+	return id, nil
+}
+
+func (s *Store) CreateWebhookDeliveries(
+	ctx context.Context,
+	tx pgx.Tx,
+	messageID uuid.UUID,
+	eventType string,
+) error {
+	payload, err := json.Marshal(map[string]any{
+		"id":         uuid.NewString(),
+		"type":       eventType,
+		"created_at": time.Now().UTC(),
+		"data":       map[string]string{"message_id": messageID.String()},
+	})
+	if err != nil {
+		return fmt.Errorf("encode customer webhook payload: %w", err)
+	}
+	_, err = tx.Exec(ctx, `
+		INSERT INTO webhook_deliveries (endpoint_id, event_type, payload, source_id)
+		SELECT id, $2, $3, $4
+		FROM webhook_endpoints
+		WHERE account_id = (SELECT account_id FROM messages WHERE id = $1)
+		  AND active = true AND $2 = ANY(subscribed_events)
+		ON CONFLICT (endpoint_id, event_type, source_id) WHERE source_id IS NOT NULL DO NOTHING`,
+		messageID, eventType, payload, messageID.String(),
+	)
+	if err != nil {
+		return fmt.Errorf("queue customer webhook deliveries: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) EmitNotificationFailure(ctx context.Context, messageID uuid.UUID) error {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin notification failure event: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := emitTerminalNotificationEvent(ctx, tx, s, messageID); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit notification failure event: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) GetWebhookDelivery(ctx context.Context, deliveryID uuid.UUID) (WebhookDelivery, error) {
+	var delivery WebhookDelivery
+	delivery.ID = deliveryID
+	err := s.pool.QueryRow(ctx, `
+		SELECT e.endpoint_url, e.secret_ciphertext, d.event_type, d.payload
+		FROM webhook_deliveries d
+		JOIN webhook_endpoints e ON e.id = d.endpoint_id
+		WHERE d.id = $1 AND e.active = true`, deliveryID,
+	).Scan(&delivery.URL, &delivery.EncryptedSecret, &delivery.EventType, &delivery.Payload)
+	if err != nil {
+		return WebhookDelivery{}, fmt.Errorf("load customer webhook delivery: %w", err)
+	}
+	return delivery, nil
+}
+
+func (s *Store) RecordWebhookAttempt(
+	ctx context.Context,
+	deliveryID uuid.UUID,
+	status string,
+	responseCode int,
+	deliveryError string,
+) error {
+	if status != "pending" && status != "delivered" && status != "failed" {
+		return fmt.Errorf("unsupported customer webhook delivery status %q", status)
+	}
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE webhook_deliveries
+		SET attempts = attempts + 1,
+		    status = $2,
+		    last_response_code = NULLIF($3, 0),
+		    last_error = NULLIF($4, ''),
+		    next_attempt_at = NULL,
+		    delivered_at = CASE WHEN $2 = 'delivered' THEN now() ELSE delivered_at END
+		WHERE id = $1`,
+		deliveryID, status, responseCode, deliveryError,
+	)
+	if err != nil {
+		return fmt.Errorf("record customer webhook attempt: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return pgx.ErrNoRows
+	}
+	return nil
+}
+
+func (s *Store) RelayOneWebhook(
+	ctx context.Context,
+	enqueue func(context.Context, uuid.UUID) error,
+) (bool, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return false, fmt.Errorf("begin webhook outbox transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var deliveryID uuid.UUID
+	err = tx.QueryRow(ctx, `
+		SELECT id FROM webhook_deliveries
+		WHERE status = 'pending'
+		  AND (queued_at IS NULL OR queued_at < now() - interval '30 minutes')
+		ORDER BY created_at
+		FOR UPDATE SKIP LOCKED LIMIT 1`).Scan(&deliveryID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if rollbackErr := tx.Rollback(ctx); rollbackErr != nil {
+			return false, fmt.Errorf("release empty webhook transaction: %w", rollbackErr)
+		}
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("select pending webhook delivery: %w", err)
+	}
+	if err := enqueue(ctx, deliveryID); err != nil {
+		return false, fmt.Errorf("enqueue webhook delivery %s: %w", deliveryID, err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE webhook_deliveries SET queued_at = now()
+		WHERE id = $1 AND queued_at IS NULL`, deliveryID); err != nil {
+		return false, fmt.Errorf("mark webhook delivery enqueued: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("commit webhook outbox transaction: %w", err)
+	}
+	return true, nil
+}
+
+func (s *Store) RunWebhookRelay(
+	ctx context.Context,
+	enqueue func(context.Context, uuid.UUID) error,
+	logger *slog.Logger,
+) {
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		published, err := s.RelayOneWebhook(ctx, enqueue)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			logger.Error("webhook outbox relay failed", "error", err)
+			if !wait(ctx, time.Second) {
+				return
+			}
+			continue
+		}
+		if !published && !wait(ctx, 500*time.Millisecond) {
+			return
+		}
+	}
 }
 
 func (s *Store) IsSMSSuppressed(ctx context.Context, accountID uuid.UUID, recipient string) (bool, error) {
@@ -390,6 +629,20 @@ func (s *Store) ReserveSMSBudget(
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	var released bool
+	err = tx.QueryRow(ctx, `
+		SELECT released FROM sms_cost_reservations WHERE message_id = $1 FOR UPDATE`, jobID,
+	).Scan(&released)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("load SMS cost reservation: %w", err)
+	}
+	if err == nil && !released {
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit existing SMS cost reservation: %w", err)
+		}
+		return nil
+	}
+
 	var rateCount int
 	err = tx.QueryRow(ctx, `
 		INSERT INTO sms_rate_limits (account_id, window_start, send_count)
@@ -404,20 +657,6 @@ func (s *Store) ReserveSMSBudget(
 	}
 	if err != nil {
 		return fmt.Errorf("reserve SMS account rate limit: %w", err)
-	}
-
-	var released bool
-	err = tx.QueryRow(ctx, `
-		SELECT released FROM sms_cost_reservations WHERE message_id = $1 FOR UPDATE`, jobID,
-	).Scan(&released)
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return fmt.Errorf("load SMS cost reservation: %w", err)
-	}
-	if err == nil && !released {
-		if err := tx.Commit(ctx); err != nil {
-			return fmt.Errorf("commit existing SMS cost reservation: %w", err)
-		}
-		return nil
 	}
 
 	var periodStart time.Time
@@ -620,6 +859,9 @@ func (s *Store) BeginSMSDelivery(
 		return false, fmt.Errorf("begin SMS delivery: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SELECT id FROM messages WHERE id = $1 FOR UPDATE`, job.ID); err != nil {
+		return false, fmt.Errorf("lock message before SMS attempt: %w", err)
+	}
 
 	var shouldSend bool
 	err = tx.QueryRow(ctx, `
@@ -642,6 +884,14 @@ func (s *Store) BeginSMSDelivery(
 		return false, fmt.Errorf("record SMS delivery start: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `
+		INSERT INTO delivery_attempts (message_id, channel, attempt_number, status, provider)
+		SELECT $1, 'sms', COALESCE(MAX(attempt_number), 0) + 1, 'sending', $2
+		FROM delivery_attempts WHERE message_id = $1 AND channel = 'sms'`,
+		job.ID, provider,
+	); err != nil {
+		return false, fmt.Errorf("record SMS delivery attempt: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
 		UPDATE messages SET status = 'processing', updated_at = now() WHERE id = $1`, job.ID); err != nil {
 		return false, fmt.Errorf("mark SMS message processing: %w", err)
 	}
@@ -657,6 +907,9 @@ func (s *Store) CompleteSMSDelivery(ctx context.Context, messageID uuid.UUID, pr
 		return fmt.Errorf("begin SMS delivery completion: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SELECT id FROM messages WHERE id = $1 FOR UPDATE`, messageID); err != nil {
+		return fmt.Errorf("lock message before SMS completion: %w", err)
+	}
 	tag, err := tx.Exec(ctx, `
 		UPDATE sms_deliveries
 		SET status = CASE WHEN status = 'sending' THEN 'accepted' ELSE status END,
@@ -668,10 +921,8 @@ func (s *Store) CompleteSMSDelivery(ctx context.Context, messageID uuid.UUID, pr
 	if tag.RowsAffected() == 0 {
 		return errors.New("SMS delivery record does not exist")
 	}
-	if _, err := tx.Exec(ctx, `
-		UPDATE messages SET status = 'queued', updated_at = now()
-		WHERE id = $1 AND status = 'processing'`, messageID); err != nil {
-		return fmt.Errorf("update accepted SMS message: %w", err)
+	if err := reconcileMessageStatus(ctx, tx, messageID); err != nil {
+		return err
 	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO message_events (message_id, event_type, details)
@@ -680,6 +931,17 @@ func (s *Store) CompleteSMSDelivery(ctx context.Context, messageID uuid.UUID, pr
 	); err != nil {
 		return fmt.Errorf("record SMS acceptance event: %w", err)
 	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE delivery_attempts SET status = 'accepted', finished_at = now()
+		WHERE id = (
+			SELECT id FROM delivery_attempts WHERE message_id = $1 AND channel = 'sms'
+			ORDER BY attempt_number DESC LIMIT 1
+		)`, messageID); err != nil {
+		return fmt.Errorf("complete SMS delivery attempt: %w", err)
+	}
+	if err := s.CreateWebhookDeliveries(ctx, tx, messageID, "notification.accepted_by_provider"); err != nil {
+		return err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit SMS delivery completion: %w", err)
 	}
@@ -687,11 +949,26 @@ func (s *Store) CompleteSMSDelivery(ctx context.Context, messageID uuid.UUID, pr
 }
 
 func (s *Store) FailSMSDelivery(ctx context.Context, messageID uuid.UUID, deliveryError error) error {
-	_, err := s.pool.Exec(ctx, `
-		UPDATE sms_deliveries SET status = 'failed', error = $2, updated_at = now()
-		WHERE message_id = $1`, messageID, deliveryError.Error())
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
+		return fmt.Errorf("begin failed SMS delivery attempt: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `
+		UPDATE sms_deliveries SET status = 'failed', error = $2, updated_at = now()
+		WHERE message_id = $1`, messageID, deliveryError.Error()); err != nil {
 		return fmt.Errorf("record failed SMS delivery: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE delivery_attempts SET status = 'failed', error = $2, finished_at = now()
+		WHERE id = (
+			SELECT id FROM delivery_attempts WHERE message_id = $1 AND channel = 'sms'
+			ORDER BY attempt_number DESC LIMIT 1
+		)`, messageID, deliveryError.Error()); err != nil {
+		return fmt.Errorf("record failed SMS delivery attempt: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit failed SMS delivery attempt: %w", err)
 	}
 	return nil
 }
@@ -702,6 +979,9 @@ func (s *Store) ProcessSMSWebhookEvent(ctx context.Context, event SMSWebhookEven
 		return false, fmt.Errorf("begin SMS webhook transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SELECT id FROM messages WHERE id = $1 FOR UPDATE`, event.MessageID); err != nil {
+		return false, fmt.Errorf("lock message before SMS webhook: %w", err)
+	}
 
 	var recipient, provider, providerMessageID string
 	if err := tx.QueryRow(ctx, `
@@ -749,10 +1029,18 @@ func (s *Store) ProcessSMSWebhookEvent(ctx context.Context, event SMSWebhookEven
 		}
 		if deliveryTag.RowsAffected() > 0 {
 			if _, err := tx.Exec(ctx, `
-			UPDATE messages SET status = 'delivered', updated_at = now()
-			WHERE id = $1 AND status != 'failed'`, event.MessageID,
-			); err != nil {
-				return false, fmt.Errorf("mark SMS message delivered: %w", err)
+				UPDATE delivery_attempts SET status = 'delivered', finished_at = now()
+				WHERE id = (
+					SELECT id FROM delivery_attempts WHERE message_id = $1 AND channel = 'sms'
+					ORDER BY attempt_number DESC LIMIT 1
+				)`, event.MessageID); err != nil {
+				return false, fmt.Errorf("complete SMS delivery attempt: %w", err)
+			}
+			if err := reconcileMessageStatus(ctx, tx, event.MessageID); err != nil {
+				return false, err
+			}
+			if err := emitTerminalNotificationEvent(ctx, tx, s, event.MessageID); err != nil {
+				return false, err
 			}
 		}
 	case "failed", "undelivered":
@@ -764,9 +1052,18 @@ func (s *Store) ProcessSMSWebhookEvent(ctx context.Context, event SMSWebhookEven
 		}
 		if deliveryTag.RowsAffected() > 0 {
 			if _, err := tx.Exec(ctx, `
-			UPDATE messages SET status = 'failed', updated_at = now() WHERE id = $1`, event.MessageID,
-			); err != nil {
-				return false, fmt.Errorf("mark SMS message failed: %w", err)
+				UPDATE delivery_attempts SET status = 'failed', error = $2, finished_at = now()
+				WHERE id = (
+					SELECT id FROM delivery_attempts WHERE message_id = $1 AND channel = 'sms'
+					ORDER BY attempt_number DESC LIMIT 1
+				)`, event.MessageID, event.EventType); err != nil {
+				return false, fmt.Errorf("mark SMS delivery attempt failed: %w", err)
+			}
+			if err := reconcileMessageStatus(ctx, tx, event.MessageID); err != nil {
+				return false, err
+			}
+			if err := emitTerminalNotificationEvent(ctx, tx, s, event.MessageID); err != nil {
+				return false, err
 			}
 		}
 	default:
@@ -864,16 +1161,158 @@ func (s *Store) MarkMessageFailed(ctx context.Context, messageID uuid.UUID, reas
 		_ = tx.Rollback(ctx)
 	}()
 	if _, err := tx.Exec(ctx, `
-			UPDATE messages SET status = 'failed', updated_at = now() WHERE id = $1`, messageID); err != nil {
-		return fmt.Errorf("mark message failed: %w", err)
-	}
-	if _, err := tx.Exec(ctx, `
 			INSERT INTO message_events (message_id, event_type, details)
 			VALUES ($1, 'delivery.failed', jsonb_build_object('reason', $2::text))`, messageID, reason); err != nil {
 		return fmt.Errorf("record message failure event: %w", err)
 	}
+	if err := reconcileMessageStatus(ctx, tx, messageID); err != nil {
+		return err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit failed message update: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) RecordChannelFailure(
+	ctx context.Context,
+	messageID uuid.UUID,
+	channel, reason string,
+) error {
+	if channel != "email" && channel != "sms" {
+		return fmt.Errorf("unsupported delivery channel %q", channel)
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin failed channel attempt: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SELECT id FROM messages WHERE id = $1 FOR UPDATE`, messageID); err != nil {
+		return fmt.Errorf("lock message before failed channel attempt: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO delivery_attempts (message_id, channel, attempt_number, status, error, finished_at)
+		SELECT $1, $2, COALESCE(MAX(attempt_number), 0) + 1, 'failed', $3, now()
+		FROM delivery_attempts WHERE message_id = $1 AND channel = $2`,
+		messageID, channel, reason,
+	); err != nil {
+		return fmt.Errorf("record failed %s channel attempt: %w", channel, err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO message_events (message_id, event_type, details)
+		VALUES ($1, 'delivery.attempt_failed', jsonb_build_object('channel', $2::text, 'reason', $3::text))`,
+		messageID, channel, reason,
+	); err != nil {
+		return fmt.Errorf("record failed %s channel event: %w", channel, err)
+	}
+	if err := reconcileMessageStatus(ctx, tx, messageID); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit failed channel attempt: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) RecordChannelSkipped(ctx context.Context, messageID uuid.UUID, channel string) error {
+	if channel != "email" && channel != "sms" {
+		return fmt.Errorf("unsupported delivery channel %q", channel)
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin skipped channel attempt: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SELECT id FROM messages WHERE id = $1 FOR UPDATE`, messageID); err != nil {
+		return fmt.Errorf("lock message before skipped channel attempt: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO delivery_attempts (message_id, channel, attempt_number, status, finished_at)
+		SELECT $1, $2, COALESCE(MAX(attempt_number), 0) + 1, 'skipped', now()
+		FROM delivery_attempts WHERE message_id = $1 AND channel = $2`,
+		messageID, channel,
+	); err != nil {
+		return fmt.Errorf("record skipped %s channel attempt: %w", channel, err)
+	}
+	if err := reconcileMessageStatus(ctx, tx, messageID); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit skipped channel attempt: %w", err)
+	}
+	return nil
+}
+
+func emitTerminalNotificationEvent(
+	ctx context.Context,
+	tx pgx.Tx,
+	repository *Store,
+	messageID uuid.UUID,
+) error {
+	var status string
+	if err := tx.QueryRow(ctx, `SELECT status FROM messages WHERE id = $1`, messageID).Scan(&status); err != nil {
+		return fmt.Errorf("load reconciled notification status: %w", err)
+	}
+	eventType := ""
+	switch status {
+	case "delivered":
+		eventType = "notification.delivered"
+	case "partially_delivered":
+		eventType = "notification.partially_delivered"
+	case "failed":
+		eventType = "notification.failed"
+	default:
+		return nil
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO message_events (message_id, event_type, details)
+		VALUES ($1, $2, '{}'::jsonb)`, messageID, eventType); err != nil {
+		return fmt.Errorf("record terminal notification event: %w", err)
+	}
+	if err := repository.CreateWebhookDeliveries(ctx, tx, messageID, eventType); err != nil {
+		return err
+	}
+	return nil
+}
+
+func reconcileMessageStatus(ctx context.Context, tx pgx.Tx, messageID uuid.UUID) error {
+	_, err := tx.Exec(ctx, `
+		UPDATE messages AS m
+		SET status = (
+			SELECT CASE
+				WHEN COUNT(*) FILTER (WHERE channel_status != 'skipped') > 0
+					AND COUNT(*) FILTER (WHERE channel_status IN ('delivered', 'skipped')) = COUNT(*)
+					THEN 'delivered'
+				WHEN COUNT(*) FILTER (WHERE channel_status IN ('delivered', 'failed', 'undelivered', 'skipped')) = COUNT(*)
+					AND COUNT(*) FILTER (WHERE channel_status = 'delivered') > 0
+					THEN 'partially_delivered'
+				WHEN COUNT(*) FILTER (WHERE channel_status IN ('failed', 'undelivered', 'skipped')) = COUNT(*)
+					AND COUNT(*) FILTER (WHERE channel_status = 'failed' OR channel_status = 'undelivered') > 0
+					THEN 'failed'
+				WHEN BOOL_OR(channel_status = 'sending') THEN 'processing'
+				ELSE 'queued'
+			END
+			FROM (
+				SELECT requested.channel,
+					CASE requested.channel
+						WHEN 'email' THEN COALESCE(
+							(SELECT CASE status WHEN 'sending' THEN 'sending' ELSE status END
+							 FROM email_deliveries WHERE message_id = m.id),
+							(SELECT status FROM delivery_attempts WHERE message_id = m.id AND channel = 'email'
+							 ORDER BY attempt_number DESC LIMIT 1))
+						WHEN 'sms' THEN COALESCE(
+							(SELECT CASE status WHEN 'sent' THEN 'accepted' WHEN 'undelivered' THEN 'failed' ELSE status END
+							 FROM sms_deliveries WHERE message_id = m.id),
+							(SELECT status FROM delivery_attempts WHERE message_id = m.id AND channel = 'sms'
+							 ORDER BY attempt_number DESC LIMIT 1))
+					END AS channel_status
+				FROM unnest(m.channels) AS requested(channel)
+			) AS channel_states
+		),
+		updated_at = now()
+		WHERE m.id = $1`, messageID)
+	if err != nil {
+		return fmt.Errorf("reconcile notification delivery status: %w", err)
 	}
 	return nil
 }
@@ -932,6 +1371,7 @@ func (s *Store) GetEmailJob(ctx context.Context, messageID uuid.UUID) (EmailJob,
 	job.Subject = notification.Content.Subject
 	job.Body = notification.Content.Body
 	job.TrafficClass = notification.TrafficClass
+	job.Routing = notification.Routing
 	return job, nil
 }
 
@@ -950,14 +1390,30 @@ func (s *Store) GetDKIMKey(ctx context.Context, accountID uuid.UUID, domainName 
 	return key, nil
 }
 
-func (s *Store) BeginEmailDelivery(ctx context.Context, job EmailJob, provider string) error {
+func (s *Store) BeginEmailDelivery(ctx context.Context, job EmailJob, provider string) (bool, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return fmt.Errorf("begin email delivery: %w", err)
+		return false, fmt.Errorf("begin email delivery: %w", err)
 	}
 	defer func() {
 		_ = tx.Rollback(ctx)
 	}()
+	if _, err := tx.Exec(ctx, `SELECT id FROM messages WHERE id = $1 FOR UPDATE`, job.ID); err != nil {
+		return false, fmt.Errorf("lock message before email attempt: %w", err)
+	}
+	var existingStatus string
+	err = tx.QueryRow(ctx, `
+		SELECT status FROM email_deliveries WHERE message_id = $1 FOR UPDATE`, job.ID,
+	).Scan(&existingStatus)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return false, fmt.Errorf("load existing email delivery: %w", err)
+	}
+	if err == nil && (existingStatus == "accepted" || existingStatus == "delivered") {
+		if err := tx.Commit(ctx); err != nil {
+			return false, fmt.Errorf("commit existing email delivery state: %w", err)
+		}
+		return false, nil
+	}
 	if _, err := tx.Exec(ctx, `
 			INSERT INTO email_deliveries (message_id, provider, status)
 			VALUES ($1, $2, 'sending')
@@ -965,16 +1421,24 @@ func (s *Store) BeginEmailDelivery(ctx context.Context, job EmailJob, provider s
 			SET provider = EXCLUDED.provider, status = 'sending', error = NULL, updated_at = now()`,
 		job.ID, provider,
 	); err != nil {
-		return fmt.Errorf("record email delivery start: %w", err)
+		return false, fmt.Errorf("record email delivery start: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO delivery_attempts (message_id, channel, attempt_number, status, provider)
+		SELECT $1, 'email', COALESCE(MAX(attempt_number), 0) + 1, 'sending', $2
+		FROM delivery_attempts WHERE message_id = $1 AND channel = 'email'`,
+		job.ID, provider,
+	); err != nil {
+		return false, fmt.Errorf("record email delivery attempt: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `
 			UPDATE messages SET status = 'processing', updated_at = now() WHERE id = $1`, job.ID); err != nil {
-		return fmt.Errorf("update message to processing: %w", err)
+		return false, fmt.Errorf("update message to processing: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit email delivery start: %w", err)
+		return false, fmt.Errorf("commit email delivery start: %w", err)
 	}
-	return nil
+	return true, nil
 }
 
 func (s *Store) CompleteEmailDelivery(ctx context.Context, messageID uuid.UUID, providerMessageID string) error {
@@ -985,6 +1449,9 @@ func (s *Store) CompleteEmailDelivery(ctx context.Context, messageID uuid.UUID, 
 	defer func() {
 		_ = tx.Rollback(ctx)
 	}()
+	if _, err := tx.Exec(ctx, `SELECT id FROM messages WHERE id = $1 FOR UPDATE`, messageID); err != nil {
+		return fmt.Errorf("lock message before email completion: %w", err)
+	}
 	tag, err := tx.Exec(ctx, `
 			UPDATE email_deliveries
 			SET status = CASE WHEN status = 'sending' THEN 'accepted' ELSE status END,
@@ -996,10 +1463,8 @@ func (s *Store) CompleteEmailDelivery(ctx context.Context, messageID uuid.UUID, 
 	if tag.RowsAffected() == 0 {
 		return errors.New("email delivery record does not exist")
 	}
-	if _, err := tx.Exec(ctx, `
-			UPDATE messages SET status = 'queued', updated_at = now()
-			WHERE id = $1 AND status = 'processing'`, messageID); err != nil {
-		return fmt.Errorf("update provider-accepted message: %w", err)
+	if err := reconcileMessageStatus(ctx, tx, messageID); err != nil {
+		return err
 	}
 	if _, err := tx.Exec(ctx, `
 			INSERT INTO message_events (message_id, event_type, details)
@@ -1008,6 +1473,17 @@ func (s *Store) CompleteEmailDelivery(ctx context.Context, messageID uuid.UUID, 
 	); err != nil {
 		return fmt.Errorf("record email delivery event: %w", err)
 	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE delivery_attempts SET status = 'accepted', finished_at = now()
+		WHERE id = (
+			SELECT id FROM delivery_attempts WHERE message_id = $1 AND channel = 'email'
+			ORDER BY attempt_number DESC LIMIT 1
+		)`, messageID); err != nil {
+		return fmt.Errorf("complete email delivery attempt: %w", err)
+	}
+	if err := s.CreateWebhookDeliveries(ctx, tx, messageID, "notification.accepted_by_provider"); err != nil {
+		return err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit email delivery completion: %w", err)
 	}
@@ -1015,11 +1491,26 @@ func (s *Store) CompleteEmailDelivery(ctx context.Context, messageID uuid.UUID, 
 }
 
 func (s *Store) FailEmailDelivery(ctx context.Context, messageID uuid.UUID, deliveryError error) error {
-	_, err := s.pool.Exec(ctx, `
-			UPDATE email_deliveries SET status = 'failed', error = $2, updated_at = now()
-			WHERE message_id = $1`, messageID, deliveryError.Error())
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
+		return fmt.Errorf("begin failed email delivery attempt: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `
+			UPDATE email_deliveries SET status = 'failed', error = $2, updated_at = now()
+			WHERE message_id = $1`, messageID, deliveryError.Error()); err != nil {
 		return fmt.Errorf("record failed email delivery: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE delivery_attempts SET status = 'failed', error = $2, finished_at = now()
+		WHERE id = (
+			SELECT id FROM delivery_attempts WHERE message_id = $1 AND channel = 'email'
+			ORDER BY attempt_number DESC LIMIT 1
+		)`, messageID, deliveryError.Error()); err != nil {
+		return fmt.Errorf("record failed email delivery attempt: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit failed email delivery attempt: %w", err)
 	}
 	return nil
 }
@@ -1032,6 +1523,9 @@ func (s *Store) ProcessEmailWebhookEvent(ctx context.Context, event EmailWebhook
 	defer func() {
 		_ = tx.Rollback(ctx)
 	}()
+	if _, err := tx.Exec(ctx, `SELECT id FROM messages WHERE id = $1 FOR UPDATE`, event.MessageID); err != nil {
+		return false, fmt.Errorf("lock message before email webhook: %w", err)
+	}
 
 	var accountID uuid.UUID
 	var payload []byte
@@ -1086,26 +1580,51 @@ func (s *Store) ProcessEmailWebhookEvent(ctx context.Context, event EmailWebhook
 		}
 	}
 	if event.EventType == "bounce" {
-		if _, err := tx.Exec(ctx, `
+		deliveryTag, err := tx.Exec(ctx, `
 				UPDATE email_deliveries SET status = 'failed', error = 'hard bounce', updated_at = now()
-				WHERE message_id = $1`, event.MessageID); err != nil {
+				WHERE message_id = $1 AND status != 'delivered'`, event.MessageID)
+		if err != nil {
 			return false, fmt.Errorf("mark bounced email delivery: %w", err)
 		}
-		if _, err := tx.Exec(ctx, `
-				UPDATE messages SET status = 'failed', updated_at = now() WHERE id = $1`, event.MessageID); err != nil {
-			return false, fmt.Errorf("mark bounced message: %w", err)
+		if deliveryTag.RowsAffected() > 0 {
+			if _, err := tx.Exec(ctx, `
+			UPDATE delivery_attempts SET status = 'failed', error = 'hard bounce', finished_at = now()
+			WHERE id = (
+				SELECT id FROM delivery_attempts WHERE message_id = $1 AND channel = 'email'
+				ORDER BY attempt_number DESC LIMIT 1
+			)`, event.MessageID); err != nil {
+				return false, fmt.Errorf("mark bounced email attempt: %w", err)
+			}
+			if err := reconcileMessageStatus(ctx, tx, event.MessageID); err != nil {
+				return false, err
+			}
+			if err := emitTerminalNotificationEvent(ctx, tx, s, event.MessageID); err != nil {
+				return false, err
+			}
 		}
 	}
 	if event.EventType == "delivered" {
-		if _, err := tx.Exec(ctx, `
+		deliveryTag, err := tx.Exec(ctx, `
 				UPDATE email_deliveries SET status = 'delivered', updated_at = now()
-				WHERE message_id = $1`, event.MessageID); err != nil {
+				WHERE message_id = $1 AND status != 'failed'`, event.MessageID)
+		if err != nil {
 			return false, fmt.Errorf("mark email delivered: %w", err)
 		}
-		if _, err := tx.Exec(ctx, `
-				UPDATE messages SET status = 'delivered', updated_at = now()
-				WHERE id = $1 AND status != 'failed'`, event.MessageID); err != nil {
-			return false, fmt.Errorf("mark message delivered: %w", err)
+		if deliveryTag.RowsAffected() > 0 {
+			if _, err := tx.Exec(ctx, `
+			UPDATE delivery_attempts SET status = 'delivered', finished_at = now()
+			WHERE id = (
+				SELECT id FROM delivery_attempts WHERE message_id = $1 AND channel = 'email'
+				ORDER BY attempt_number DESC LIMIT 1
+			)`, event.MessageID); err != nil {
+				return false, fmt.Errorf("complete email delivery attempt: %w", err)
+			}
+			if err := reconcileMessageStatus(ctx, tx, event.MessageID); err != nil {
+				return false, err
+			}
+			if err := emitTerminalNotificationEvent(ctx, tx, s, event.MessageID); err != nil {
+				return false, err
+			}
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -1173,6 +1692,9 @@ func (s *Store) AcceptNotification(
 		INSERT INTO message_events (message_id, event_type, details)
 		VALUES ($1, 'accepted', '{}'::jsonb)`, messageID); err != nil {
 		return uuid.Nil, false, fmt.Errorf("record accepted message event: %w", err)
+	}
+	if err := s.CreateWebhookDeliveries(ctx, tx, messageID, "notification.accepted"); err != nil {
+		return uuid.Nil, false, err
 	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO outbox (message_id, task_type)

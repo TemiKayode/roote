@@ -17,6 +17,7 @@ import (
 const TaskNotificationDelivery = "notification:deliver"
 const TaskDomainVerification = "domain:verify"
 const TaskSMSStopConfirmation = "sms:stop-confirm"
+const TaskWebhookDelivery = "webhook:deliver"
 
 type notificationPayload struct {
 	MessageID string `json:"message_id"`
@@ -31,6 +32,10 @@ type smsStopConfirmationPayload struct {
 	Provider string `json:"provider"`
 	Phone    string `json:"phone"`
 	EventID  string `json:"event_id"`
+}
+
+type webhookDeliveryPayload struct {
+	DeliveryID string `json:"delivery_id"`
 }
 
 func EnqueueNotification(ctx context.Context, client *asynq.Client, queueName string, messageID uuid.UUID) error {
@@ -96,15 +101,39 @@ func EnqueueSMSStopConfirmation(
 	return nil
 }
 
+func EnqueueWebhookDelivery(
+	ctx context.Context,
+	client *asynq.Client,
+	queueName string,
+	deliveryID uuid.UUID,
+) error {
+	payload, err := json.Marshal(webhookDeliveryPayload{DeliveryID: deliveryID.String()})
+	if err != nil {
+		return fmt.Errorf("marshal webhook delivery task: %w", err)
+	}
+	_, err = client.EnqueueContext(ctx, asynq.NewTask(TaskWebhookDelivery, payload),
+		asynq.Queue(queueName),
+		asynq.TaskID("webhook-"+deliveryID.String()),
+		asynq.MaxRetry(8),
+		asynq.Unique(24*time.Hour),
+	)
+	if err != nil && !errors.Is(err, asynq.ErrTaskIDConflict) && !errors.Is(err, asynq.ErrDuplicateTask) {
+		return fmt.Errorf("enqueue webhook delivery: %w", err)
+	}
+	return nil
+}
+
 type NotificationHandler func(context.Context, uuid.UUID) error
 type DomainVerificationHandler func(context.Context, string, uuid.UUID) error
 type SMSStopConfirmationHandler func(context.Context, string, string, string) error
+type WebhookDeliveryHandler func(context.Context, uuid.UUID) error
 
 func NewServeMux(
 	logger *slog.Logger,
 	handleNotification NotificationHandler,
 	handleDomainVerification DomainVerificationHandler,
 	handleSMSStopConfirmation SMSStopConfirmationHandler,
+	handleWebhookDelivery WebhookDeliveryHandler,
 ) *asynq.ServeMux {
 	mux := asynq.NewServeMux()
 	mux.HandleFunc(TaskNotificationDelivery, func(ctx context.Context, task *asynq.Task) error {
@@ -152,6 +181,20 @@ func NewServeMux(
 		}
 		logger.InfoContext(ctx, "sending SMS opt-out confirmation", "provider", payload.Provider)
 		return handleSMSStopConfirmation(ctx, payload.Provider, payload.Phone, payload.EventID)
+	})
+	mux.HandleFunc(TaskWebhookDelivery, func(ctx context.Context, task *asynq.Task) error {
+		var payload webhookDeliveryPayload
+		if err := json.Unmarshal(task.Payload(), &payload); err != nil {
+			return fmt.Errorf("decode webhook delivery task: %w", err)
+		}
+		deliveryID, err := uuid.Parse(payload.DeliveryID)
+		if err != nil {
+			return fmt.Errorf("invalid webhook delivery ID in task: %w", err)
+		}
+		if handleWebhookDelivery == nil {
+			return errors.New("webhook delivery handler is not configured")
+		}
+		return handleWebhookDelivery(ctx, deliveryID)
 	})
 	return mux
 }
