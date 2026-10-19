@@ -1,0 +1,119 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: notify
+      POSTGRES_USER: notify
+      POSTGRES_PASSWORD: notify-local-only
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U notify -d notify"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7.4-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - redis-data:/data
+
+  api:
+    build: .
+    environment:
+      APP_PORT: ${APP_PORT:-8080}
+      GIN_MODE: release
+      DATABASE_URL: ${DATABASE_URL:-postgres://notify:notify-local-only@postgres:5432/notify?sslmode=disable}
+      REDIS_URL: ${REDIS_URL:-redis:6379}
+      ACCOUNT_ID: ${ACCOUNT_ID:-00000000-0000-4000-8000-000000000001}
+      ASYNQ_QUEUE: ${ASYNQ_QUEUE:-notifications}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      DKIM_ENCRYPTION_KEY: ${DKIM_ENCRYPTION_KEY:-}
+      SENDGRID_WEBHOOK_PUBLIC_KEY: ${SENDGRID_WEBHOOK_PUBLIC_KEY:-}
+      EMAIL_TRANSPORT: ${EMAIL_TRANSPORT:-disabled}
+      EMAIL_FROM: ${EMAIL_FROM:-}
+      EMAIL_SPF_VALUE: ${EMAIL_SPF_VALUE:-v=spf1 include:sendgrid.net ~all}
+      MARKETING_UNSUBSCRIBE_URL: ${MARKETING_UNSUBSCRIBE_URL:-}
+      SENDGRID_API_KEY: ${SENDGRID_API_KEY:-}
+      SENDGRID_TRANSACTIONAL_IP_POOL: ${SENDGRID_TRANSACTIONAL_IP_POOL:-}
+      SENDGRID_MARKETING_IP_POOL: ${SENDGRID_MARKETING_IP_POOL:-}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-2525}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_REQUIRE_TLS: ${SMTP_REQUIRE_TLS:-true}
+      SMS_TRANSPORT: ${SMS_TRANSPORT:-disabled}
+      SMS_FROM: ${SMS_FROM:-}
+      SMS_STATUS_CALLBACK_URL: ${SMS_STATUS_CALLBACK_URL:-}
+      TWILIO_INBOUND_WEBHOOK_URL: ${TWILIO_INBOUND_WEBHOOK_URL:-}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
+      TELNYX_API_KEY: ${TELNYX_API_KEY:-}
+      TELNYX_WEBHOOK_PUBLIC_KEY: ${TELNYX_WEBHOOK_PUBLIC_KEY:-}
+      SMS_RATE_LIMIT_PER_MINUTE: ${SMS_RATE_LIMIT_PER_MINUTE:-60}
+      SMS_COUNTRY_RATES_USD: ${SMS_COUNTRY_RATES_USD:-}
+      SMS_COUNTRY_MONTHLY_CAPS_USD: ${SMS_COUNTRY_MONTHLY_CAPS_USD:-}
+      SMS_STOP_CONFIRMATION: ${SMS_STOP_CONFIRMATION:-You have been unsubscribed and will not receive further SMS messages.}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${APP_PORT:-8080}:${APP_PORT:-8080}"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:$${APP_PORT}/healthz >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  worker:
+    build: .
+    entrypoint: ["/app/worker"]
+    environment:
+      APP_PORT: ${APP_PORT:-8080}
+      DATABASE_URL: ${DATABASE_URL:-postgres://notify:notify-local-only@postgres:5432/notify?sslmode=disable}
+      REDIS_URL: ${REDIS_URL:-redis:6379}
+      ACCOUNT_ID: ${ACCOUNT_ID:-00000000-0000-4000-8000-000000000001}
+      ASYNQ_QUEUE: ${ASYNQ_QUEUE:-notifications}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      DKIM_ENCRYPTION_KEY: ${DKIM_ENCRYPTION_KEY:-}
+      SENDGRID_WEBHOOK_PUBLIC_KEY: ${SENDGRID_WEBHOOK_PUBLIC_KEY:-}
+      EMAIL_TRANSPORT: ${EMAIL_TRANSPORT:-disabled}
+      EMAIL_FROM: ${EMAIL_FROM:-}
+      EMAIL_SPF_VALUE: ${EMAIL_SPF_VALUE:-v=spf1 include:sendgrid.net ~all}
+      MARKETING_UNSUBSCRIBE_URL: ${MARKETING_UNSUBSCRIBE_URL:-}
+      SENDGRID_API_KEY: ${SENDGRID_API_KEY:-}
+      SENDGRID_TRANSACTIONAL_IP_POOL: ${SENDGRID_TRANSACTIONAL_IP_POOL:-}
+      SENDGRID_MARKETING_IP_POOL: ${SENDGRID_MARKETING_IP_POOL:-}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-2525}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_REQUIRE_TLS: ${SMTP_REQUIRE_TLS:-true}
+      SMS_TRANSPORT: ${SMS_TRANSPORT:-disabled}
+      SMS_FROM: ${SMS_FROM:-}
+      SMS_STATUS_CALLBACK_URL: ${SMS_STATUS_CALLBACK_URL:-}
+      TWILIO_INBOUND_WEBHOOK_URL: ${TWILIO_INBOUND_WEBHOOK_URL:-}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
+      TELNYX_API_KEY: ${TELNYX_API_KEY:-}
+      TELNYX_WEBHOOK_PUBLIC_KEY: ${TELNYX_WEBHOOK_PUBLIC_KEY:-}
+      SMS_RATE_LIMIT_PER_MINUTE: ${SMS_RATE_LIMIT_PER_MINUTE:-60}
+      SMS_COUNTRY_RATES_USD: ${SMS_COUNTRY_RATES_USD:-}
+      SMS_COUNTRY_MONTHLY_CAPS_USD: ${SMS_COUNTRY_MONTHLY_CAPS_USD:-}
+      SMS_STOP_CONFIRMATION: ${SMS_STOP_CONFIRMATION:-You have been unsubscribed and will not receive further SMS messages.}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
+  redis-data:

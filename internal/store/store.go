@@ -1,0 +1,1279 @@
+package store
+
+import (
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"embed"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/pressly/goose/v3"
+)
+
+//go:embed migrations/*.sql
+var migrations embed.FS
+
+const migrationAdvisoryLock int64 = 824771004691823008
+
+var (
+	ErrIdempotencyConflict = errors.New("idempotency key was already used with a different request")
+	ErrSMSRateLimit        = errors.New("SMS account rate limit exceeded")
+	ErrSMSCountryBudget    = errors.New("SMS country monthly budget exceeded")
+	ErrSMSConsentRequired  = errors.New("active SMS consent is required")
+)
+
+type Store struct {
+	pool *pgxpool.Pool
+}
+
+type Notification struct {
+	Event        string   `json:"event"`
+	Channels     []string `json:"channels"`
+	TrafficClass string   `json:"traffic_class,omitempty"`
+	Recipient    struct {
+		Email string `json:"email,omitempty"`
+		Phone string `json:"phone,omitempty"`
+	} `json:"recipient"`
+	Content struct {
+		Subject string `json:"subject,omitempty"`
+		Body    string `json:"body"`
+	} `json:"content"`
+}
+
+type Domain struct {
+	ID                    uuid.UUID
+	AccountID             uuid.UUID
+	Name                  string
+	Selector              string
+	PublicKey             string
+	EncryptedPrivateKey   []byte
+	SPFValue              string
+	VerificationStatus    string
+	LastVerificationError string
+}
+
+type EmailJob struct {
+	ID           uuid.UUID
+	AccountID    uuid.UUID
+	Channels     []string
+	Recipient    string
+	Subject      string
+	Body         string
+	TrafficClass string
+}
+
+type SMSJob struct {
+	ID           uuid.UUID
+	AccountID    uuid.UUID
+	Channels     []string
+	Recipient    string
+	Body         string
+	TrafficClass string
+}
+
+type DKIMKey struct {
+	Selector            string
+	EncryptedPrivateKey []byte
+}
+
+type EmailWebhookEvent struct {
+	ProviderEventID string
+	MessageID       uuid.UUID
+	Recipient       string
+	EventType       string
+}
+
+type SMSWebhookEvent struct {
+	ProviderEventID   string
+	ProviderMessageID string
+	Provider          string
+	MessageID         uuid.UUID
+	Recipient         string
+	EventType         string
+}
+
+func Open(ctx context.Context, databaseURL, accountID string) (*Store, error) {
+	poolConfig, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse database URL: %w", err)
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
+	if err != nil {
+		return nil, fmt.Errorf("create PostgreSQL pool: %w", err)
+	}
+	connectCtx, cancelConnect := context.WithTimeout(ctx, 30*time.Second)
+	defer cancelConnect()
+	for {
+		err = pool.Ping(connectCtx)
+		if err == nil {
+			break
+		}
+		if !wait(connectCtx, 250*time.Millisecond) {
+			pool.Close()
+			return nil, fmt.Errorf("connect to PostgreSQL: %w", errors.Join(connectCtx.Err(), err))
+		}
+	}
+
+	db, err := sql.Open("pgx", databaseURL)
+	if err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("open migration connection pool: %w", err)
+	}
+	if err := runMigrations(ctx, db); err != nil {
+		_ = db.Close()
+		pool.Close()
+		return nil, err
+	}
+	if err := db.Close(); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("close migration connection pool: %w", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO accounts (id, name)
+		VALUES ($1, 'Local development account')
+		ON CONFLICT (id) DO NOTHING`, accountID); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("ensure configured account exists: %w", err)
+	}
+	return &Store{pool: pool}, nil
+}
+
+func runMigrations(ctx context.Context, db *sql.DB) error {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire migration lock connection: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock($1)`, migrationAdvisoryLock); err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("acquire migration lock: %w", err)
+	}
+
+	goose.SetBaseFS(migrations)
+	migrationErr := goose.UpContext(ctx, db, "migrations")
+	unlockCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, unlockErr := conn.ExecContext(unlockCtx, `SELECT pg_advisory_unlock($1)`, migrationAdvisoryLock)
+	closeErr := conn.Close()
+	if migrationErr != nil {
+		return fmt.Errorf("apply database migrations: %w", migrationErr)
+	}
+	if unlockErr != nil {
+		return fmt.Errorf("release migration lock: %w", unlockErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close migration lock connection: %w", closeErr)
+	}
+	return nil
+}
+
+func (s *Store) Close() {
+	s.pool.Close()
+}
+
+func (s *Store) Ping(ctx context.Context) error {
+	if err := s.pool.Ping(ctx); err != nil {
+		return fmt.Errorf("ping PostgreSQL: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) CreateDomain(
+	ctx context.Context,
+	accountID, name, selector, publicKey, spfValue string,
+	encryptedPrivateKey []byte,
+) (Domain, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return Domain{}, fmt.Errorf("begin sending domain transaction: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
+	var domain Domain
+	err = tx.QueryRow(ctx, `
+			INSERT INTO domains (account_id, domain_name, spf_value)
+			VALUES ($1, $2, $3)
+			RETURNING id, account_id, domain_name, spf_value, verification_status`,
+		accountID, name, spfValue,
+	).Scan(&domain.ID, &domain.AccountID, &domain.Name, &domain.SPFValue, &domain.VerificationStatus)
+	if err != nil {
+		return Domain{}, fmt.Errorf("insert sending domain: %w", err)
+	}
+	_, err = tx.Exec(ctx, `
+			INSERT INTO dkim_keys (domain_id, selector, encrypted_private_key, public_key)
+			VALUES ($1, $2, $3, $4)`,
+		domain.ID, selector, encryptedPrivateKey, publicKey,
+	)
+	if err != nil {
+		return Domain{}, fmt.Errorf("insert DKIM key: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Domain{}, fmt.Errorf("commit sending domain transaction: %w", err)
+	}
+	domain.Selector = selector
+	domain.PublicKey = publicKey
+	return domain, nil
+}
+
+func (s *Store) GetDomain(ctx context.Context, accountID string, domainID uuid.UUID) (Domain, error) {
+	var domain Domain
+	err := s.pool.QueryRow(ctx, `
+			SELECT d.id, d.account_id, d.domain_name, d.spf_value, d.verification_status,
+			       COALESCE(d.last_verification_error, ''), k.selector, k.public_key,
+			       k.encrypted_private_key
+			FROM domains d
+			JOIN dkim_keys k ON k.domain_id = d.id
+			WHERE d.account_id = $1 AND d.id = $2`, accountID, domainID,
+	).Scan(
+		&domain.ID, &domain.AccountID, &domain.Name, &domain.SPFValue,
+		&domain.VerificationStatus, &domain.LastVerificationError, &domain.Selector,
+		&domain.PublicKey, &domain.EncryptedPrivateKey,
+	)
+	if err != nil {
+		return Domain{}, fmt.Errorf("load sending domain: %w", err)
+	}
+	return domain, nil
+}
+
+func (s *Store) RequestDomainVerification(ctx context.Context, accountID string, domainID uuid.UUID) error {
+	result, err := s.pool.Exec(ctx, `
+			UPDATE domains
+			SET verification_status = 'pending', last_verification_error = NULL, last_verification_at = now()
+			WHERE account_id = $1 AND id = $2`, accountID, domainID)
+	if err != nil {
+		return fmt.Errorf("request domain verification: %w", err)
+	}
+	if result.RowsAffected() == 0 {
+		return pgx.ErrNoRows
+	}
+	return nil
+}
+
+func (s *Store) IsEmailSuppressed(ctx context.Context, accountID uuid.UUID, recipient string) (bool, error) {
+	var suppressed bool
+	err := s.pool.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM suppressions
+				WHERE account_id = $1 AND channel = 'email' AND lower(recipient) = lower($2)
+			)`, accountID, recipient).Scan(&suppressed)
+	if err != nil {
+		return false, fmt.Errorf("check email suppression: %w", err)
+	}
+	return suppressed, nil
+}
+
+func (s *Store) GetSMSJob(ctx context.Context, messageID uuid.UUID) (SMSJob, error) {
+	var job SMSJob
+	var payload []byte
+	err := s.pool.QueryRow(ctx, `
+		SELECT account_id, channels, payload
+		FROM messages WHERE id = $1`, messageID,
+	).Scan(&job.AccountID, &job.Channels, &payload)
+	if err != nil {
+		return SMSJob{}, fmt.Errorf("load message for SMS delivery: %w", err)
+	}
+	var notification Notification
+	if err := json.Unmarshal(payload, &notification); err != nil {
+		return SMSJob{}, fmt.Errorf("decode stored SMS notification: %w", err)
+	}
+	job.ID = messageID
+	job.Recipient = notification.Recipient.Phone
+	job.Body = notification.Content.Body
+	job.TrafficClass = notification.TrafficClass
+	return job, nil
+}
+
+func (s *Store) IsSMSSuppressed(ctx context.Context, accountID uuid.UUID, recipient string) (bool, error) {
+	var suppressed bool
+	err := s.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM suppressions
+			WHERE account_id = $1 AND channel = 'sms' AND recipient = $2
+		)`, accountID, recipient).Scan(&suppressed)
+	if err != nil {
+		return false, fmt.Errorf("check SMS suppression: %w", err)
+	}
+	return suppressed, nil
+}
+
+func (s *Store) HasSMSConsent(ctx context.Context, accountID uuid.UUID, recipient, scope string) (bool, error) {
+	var consented bool
+	err := s.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM consent_records
+			WHERE account_id = $1 AND recipient = $2 AND channel = 'sms'
+			  AND scope IN ($3, 'all') AND withdrawn_at IS NULL
+		)`, accountID, recipient, scope).Scan(&consented)
+	if err != nil {
+		return false, fmt.Errorf("check SMS consent: %w", err)
+	}
+	return consented, nil
+}
+
+func (s *Store) RecordSMSConsent(
+	ctx context.Context,
+	accountID uuid.UUID,
+	recipient, scope, source string,
+	consented bool,
+) error {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin SMS consent update: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if consented {
+		withdrawQuery := `
+			UPDATE consent_records SET withdrawn_at = now()
+			WHERE account_id = $1 AND recipient = $2 AND channel = 'sms' AND withdrawn_at IS NULL
+			  AND ($3 = 'all' OR scope = $3)`
+		if _, err := tx.Exec(ctx, withdrawQuery, accountID, recipient, scope); err != nil {
+			return fmt.Errorf("replace existing SMS consent: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO consent_records (account_id, recipient, channel, scope, consent_source, consented_at)
+			VALUES ($1, $2, 'sms', $3, $4, now())`,
+			accountID, recipient, scope, source,
+		); err != nil {
+			return fmt.Errorf("record SMS consent: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			DELETE FROM suppressions
+			WHERE account_id = $1 AND recipient = $2 AND channel = 'sms'
+			  AND reason IN ('opt_out', 'stop')`, accountID, recipient,
+		); err != nil {
+			return fmt.Errorf("clear re-consented SMS opt-out: %w", err)
+		}
+	} else {
+		if _, err := tx.Exec(ctx, `
+			UPDATE consent_records SET withdrawn_at = now()
+			WHERE account_id = $1 AND recipient = $2 AND channel = 'sms' AND withdrawn_at IS NULL`,
+			accountID, recipient,
+		); err != nil {
+			return fmt.Errorf("withdraw SMS consent: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO suppressions (account_id, recipient, channel, reason, source)
+			VALUES ($1, $2, 'sms', 'opt_out', $3)
+			ON CONFLICT (account_id, recipient, channel) DO UPDATE
+			SET reason = 'opt_out', source = EXCLUDED.source, created_at = now()`,
+			accountID, recipient, source,
+		); err != nil {
+			return fmt.Errorf("suppress opted-out SMS recipient: %w", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit SMS consent update: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ReserveSMSBudget(
+	ctx context.Context,
+	jobID, accountID uuid.UUID,
+	countryCode string,
+	costUSD, monthlyCapUSD float64,
+	rateLimitPerMinute int,
+) error {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin SMS budget reservation: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var rateCount int
+	err = tx.QueryRow(ctx, `
+		INSERT INTO sms_rate_limits (account_id, window_start, send_count)
+		VALUES ($1, date_trunc('minute', now()), 1)
+		ON CONFLICT (account_id, window_start) DO UPDATE
+		SET send_count = sms_rate_limits.send_count + 1
+		WHERE sms_rate_limits.send_count < $2
+		RETURNING send_count`, accountID, rateLimitPerMinute,
+	).Scan(&rateCount)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrSMSRateLimit
+	}
+	if err != nil {
+		return fmt.Errorf("reserve SMS account rate limit: %w", err)
+	}
+
+	var released bool
+	err = tx.QueryRow(ctx, `
+		SELECT released FROM sms_cost_reservations WHERE message_id = $1 FOR UPDATE`, jobID,
+	).Scan(&released)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("load SMS cost reservation: %w", err)
+	}
+	if err == nil && !released {
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit existing SMS cost reservation: %w", err)
+		}
+		return nil
+	}
+
+	var periodStart time.Time
+	err = tx.QueryRow(ctx, `
+		INSERT INTO sms_country_spend (account_id, country_code, period_start, amount_reserved_usd)
+		VALUES ($1, $2, date_trunc('month', now() AT TIME ZONE 'UTC')::date, $3)
+		ON CONFLICT (account_id, country_code, period_start) DO UPDATE
+		SET amount_reserved_usd = sms_country_spend.amount_reserved_usd + EXCLUDED.amount_reserved_usd
+		WHERE sms_country_spend.amount_reserved_usd + EXCLUDED.amount_reserved_usd <= $4
+		RETURNING period_start`, accountID, countryCode, costUSD, monthlyCapUSD,
+	).Scan(&periodStart)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrSMSCountryBudget
+	}
+	if err != nil {
+		return fmt.Errorf("reserve SMS country budget: %w", err)
+	}
+
+	_, err = tx.Exec(ctx, `
+		INSERT INTO sms_cost_reservations (message_id, account_id, country_code, period_start, amount_usd, released)
+		VALUES ($1, $2, $3, $4, $5, false)
+		ON CONFLICT (message_id) DO UPDATE
+		SET account_id = EXCLUDED.account_id, country_code = EXCLUDED.country_code,
+		    period_start = EXCLUDED.period_start, amount_usd = EXCLUDED.amount_usd, released = false`,
+		jobID, accountID, countryCode, periodStart, costUSD,
+	)
+	if err != nil {
+		return fmt.Errorf("save SMS cost reservation: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit SMS cost reservation: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ReleaseSMSBudget(ctx context.Context, jobID uuid.UUID) error {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin SMS budget release: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var accountID uuid.UUID
+	var countryCode string
+	var periodStart time.Time
+	var amount float64
+	err = tx.QueryRow(ctx, `
+		UPDATE sms_cost_reservations
+		SET released = true
+		WHERE message_id = $1 AND released = false
+		RETURNING account_id, country_code, period_start, amount_usd`, jobID,
+	).Scan(&accountID, &countryCode, &periodStart, &amount)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit empty SMS budget release: %w", err)
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("load SMS budget reservation to release: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE sms_country_spend
+		SET amount_reserved_usd = GREATEST(0, amount_reserved_usd - $4)
+		WHERE account_id = $1 AND country_code = $2 AND period_start = $3`,
+		accountID, countryCode, periodStart, amount,
+	); err != nil {
+		return fmt.Errorf("release SMS country spend: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit SMS budget release: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ReserveSMSConfirmationBudget(
+	ctx context.Context,
+	reservationID string,
+	accountID uuid.UUID,
+	countryCode string,
+	costUSD, monthlyCapUSD float64,
+	rateLimitPerMinute int,
+) error {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin SMS confirmation budget reservation: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var rateCount int
+	err = tx.QueryRow(ctx, `
+		INSERT INTO sms_rate_limits (account_id, window_start, send_count)
+		VALUES ($1, date_trunc('minute', now()), 1)
+		ON CONFLICT (account_id, window_start) DO UPDATE
+		SET send_count = sms_rate_limits.send_count + 1
+		WHERE sms_rate_limits.send_count < $2
+		RETURNING send_count`, accountID, rateLimitPerMinute,
+	).Scan(&rateCount)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrSMSRateLimit
+		}
+		return fmt.Errorf("reserve SMS confirmation rate limit: %w", err)
+	}
+
+	var released bool
+	err = tx.QueryRow(ctx, `
+		SELECT released FROM sms_system_cost_reservations
+		WHERE reservation_id = $1 FOR UPDATE`, reservationID,
+	).Scan(&released)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("load SMS confirmation cost reservation: %w", err)
+	}
+	if err == nil && !released {
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit existing SMS confirmation reservation: %w", err)
+		}
+		return nil
+	}
+
+	var periodStart time.Time
+	err = tx.QueryRow(ctx, `
+		INSERT INTO sms_country_spend (account_id, country_code, period_start, amount_reserved_usd)
+		VALUES ($1, $2, date_trunc('month', now() AT TIME ZONE 'UTC')::date, $3)
+		ON CONFLICT (account_id, country_code, period_start) DO UPDATE
+		SET amount_reserved_usd = sms_country_spend.amount_reserved_usd + EXCLUDED.amount_reserved_usd
+		WHERE sms_country_spend.amount_reserved_usd + EXCLUDED.amount_reserved_usd <= $4
+		RETURNING period_start`, accountID, countryCode, costUSD, monthlyCapUSD,
+	).Scan(&periodStart)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrSMSCountryBudget
+	}
+	if err != nil {
+		return fmt.Errorf("reserve SMS confirmation country budget: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO sms_system_cost_reservations
+			(reservation_id, account_id, country_code, period_start, amount_usd, released)
+		VALUES ($1, $2, $3, $4, $5, false)
+		ON CONFLICT (reservation_id) DO UPDATE
+		SET account_id = EXCLUDED.account_id, country_code = EXCLUDED.country_code,
+		    period_start = EXCLUDED.period_start, amount_usd = EXCLUDED.amount_usd, released = false`,
+		reservationID, accountID, countryCode, periodStart, costUSD,
+	); err != nil {
+		return fmt.Errorf("save SMS confirmation cost reservation: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit SMS confirmation budget reservation: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ReleaseSMSConfirmationBudget(ctx context.Context, reservationID string) error {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin SMS confirmation budget release: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var accountID uuid.UUID
+	var countryCode string
+	var periodStart time.Time
+	var amount float64
+	err = tx.QueryRow(ctx, `
+		UPDATE sms_system_cost_reservations SET released = true
+		WHERE reservation_id = $1 AND released = false
+		RETURNING account_id, country_code, period_start, amount_usd`, reservationID,
+	).Scan(&accountID, &countryCode, &periodStart, &amount)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit empty SMS confirmation budget release: %w", err)
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("load SMS confirmation reservation to release: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE sms_country_spend
+		SET amount_reserved_usd = GREATEST(0, amount_reserved_usd - $4)
+		WHERE account_id = $1 AND country_code = $2 AND period_start = $3`,
+		accountID, countryCode, periodStart, amount,
+	); err != nil {
+		return fmt.Errorf("release SMS confirmation country spend: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit SMS confirmation budget release: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) BeginSMSDelivery(
+	ctx context.Context,
+	job SMSJob,
+	provider, countryCode string,
+	estimatedCostUSD float64,
+) (bool, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return false, fmt.Errorf("begin SMS delivery: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var shouldSend bool
+	err = tx.QueryRow(ctx, `
+		INSERT INTO sms_deliveries (message_id, provider, recipient, country_code, estimated_cost_usd, status)
+		VALUES ($1, $2, $3, $4, $5, 'sending')
+		ON CONFLICT (message_id) DO UPDATE
+		SET provider = EXCLUDED.provider, recipient = EXCLUDED.recipient,
+		    country_code = EXCLUDED.country_code, estimated_cost_usd = EXCLUDED.estimated_cost_usd,
+		    status = 'sending', error = NULL, updated_at = now()
+		WHERE sms_deliveries.status NOT IN ('accepted', 'sent', 'delivered')
+		RETURNING true`, job.ID, provider, job.Recipient, countryCode, estimatedCostUSD,
+	).Scan(&shouldSend)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if err := tx.Commit(ctx); err != nil {
+			return false, fmt.Errorf("commit existing SMS delivery state: %w", err)
+		}
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("record SMS delivery start: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE messages SET status = 'processing', updated_at = now() WHERE id = $1`, job.ID); err != nil {
+		return false, fmt.Errorf("mark SMS message processing: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("commit SMS delivery start: %w", err)
+	}
+	return true, nil
+}
+
+func (s *Store) CompleteSMSDelivery(ctx context.Context, messageID uuid.UUID, providerMessageID string) error {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin SMS delivery completion: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	tag, err := tx.Exec(ctx, `
+		UPDATE sms_deliveries
+		SET status = CASE WHEN status = 'sending' THEN 'accepted' ELSE status END,
+		    provider_message_id = NULLIF($2, ''), error = NULL, updated_at = now()
+		WHERE message_id = $1`, messageID, providerMessageID)
+	if err != nil {
+		return fmt.Errorf("record provider-accepted SMS: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return errors.New("SMS delivery record does not exist")
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE messages SET status = 'queued', updated_at = now()
+		WHERE id = $1 AND status = 'processing'`, messageID); err != nil {
+		return fmt.Errorf("update accepted SMS message: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO message_events (message_id, event_type, details)
+		VALUES ($1, 'sms.accepted_by_provider', jsonb_build_object('provider_message_id', $2::text))`,
+		messageID, providerMessageID,
+	); err != nil {
+		return fmt.Errorf("record SMS acceptance event: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit SMS delivery completion: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) FailSMSDelivery(ctx context.Context, messageID uuid.UUID, deliveryError error) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE sms_deliveries SET status = 'failed', error = $2, updated_at = now()
+		WHERE message_id = $1`, messageID, deliveryError.Error())
+	if err != nil {
+		return fmt.Errorf("record failed SMS delivery: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ProcessSMSWebhookEvent(ctx context.Context, event SMSWebhookEvent) (bool, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return false, fmt.Errorf("begin SMS webhook transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var recipient, provider, providerMessageID string
+	if err := tx.QueryRow(ctx, `
+		SELECT recipient, provider, provider_message_id
+		FROM sms_deliveries WHERE message_id = $1`, event.MessageID,
+	).Scan(&recipient, &provider, &providerMessageID); err != nil {
+		return false, fmt.Errorf("load SMS delivery for webhook: %w", err)
+	}
+	if recipient != event.Recipient {
+		return false, errors.New("SMS webhook recipient does not match message")
+	}
+	if provider != event.Provider || providerMessageID == "" || providerMessageID != event.ProviderMessageID {
+		return false, errors.New("SMS webhook provider message does not match delivery")
+	}
+	tag, err := tx.Exec(ctx, `
+		INSERT INTO sms_webhook_events (provider_event_id, message_id, event_type)
+		VALUES ($1, $2, $3) ON CONFLICT (provider_event_id) DO NOTHING`,
+		event.ProviderEventID, event.MessageID, event.EventType,
+	)
+	if err != nil {
+		return false, fmt.Errorf("record SMS webhook event: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		if err := tx.Commit(ctx); err != nil {
+			return false, fmt.Errorf("commit duplicate SMS webhook: %w", err)
+		}
+		return false, nil
+	}
+	switch event.EventType {
+	case "sent", "accepted":
+		if _, err := tx.Exec(ctx, `
+			UPDATE sms_deliveries SET status = 'sent', updated_at = now()
+			WHERE message_id = $1 AND status NOT IN ('delivered', 'failed', 'undelivered')`, event.MessageID,
+		); err != nil {
+			return false, fmt.Errorf("mark SMS sent: %w", err)
+		}
+	case "delivered":
+		deliveryTag, err := tx.Exec(ctx, `
+			UPDATE sms_deliveries SET status = 'delivered', error = NULL, updated_at = now()
+			WHERE message_id = $1
+			  AND EXISTS (SELECT 1 FROM messages WHERE id = $1 AND status != 'failed')
+			  AND status != 'undelivered'`, event.MessageID)
+		if err != nil {
+			return false, fmt.Errorf("mark SMS delivered: %w", err)
+		}
+		if deliveryTag.RowsAffected() > 0 {
+			if _, err := tx.Exec(ctx, `
+			UPDATE messages SET status = 'delivered', updated_at = now()
+			WHERE id = $1 AND status != 'failed'`, event.MessageID,
+			); err != nil {
+				return false, fmt.Errorf("mark SMS message delivered: %w", err)
+			}
+		}
+	case "failed", "undelivered":
+		deliveryTag, err := tx.Exec(ctx, `
+			UPDATE sms_deliveries SET status = 'undelivered', error = $2, updated_at = now()
+			WHERE message_id = $1 AND status != 'delivered'`, event.MessageID, event.EventType)
+		if err != nil {
+			return false, fmt.Errorf("mark SMS undelivered: %w", err)
+		}
+		if deliveryTag.RowsAffected() > 0 {
+			if _, err := tx.Exec(ctx, `
+			UPDATE messages SET status = 'failed', updated_at = now() WHERE id = $1`, event.MessageID,
+			); err != nil {
+				return false, fmt.Errorf("mark SMS message failed: %w", err)
+			}
+		}
+	default:
+		return false, fmt.Errorf("unsupported SMS webhook event type %q", event.EventType)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO message_events (message_id, event_type, details)
+		VALUES ($1, $2, jsonb_build_object('provider_event_id', $3::text))`,
+		event.MessageID, "sms."+event.EventType, event.ProviderEventID,
+	); err != nil {
+		return false, fmt.Errorf("record SMS webhook state event: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("commit SMS webhook event: %w", err)
+	}
+	return true, nil
+}
+
+func (s *Store) ProcessSMSInbound(
+	ctx context.Context,
+	accountID uuid.UUID,
+	providerEventID, recipient, text string,
+) (bool, error) {
+	optOut := isSMSOptOut(text)
+	eventType := "inbound"
+	if optOut {
+		eventType = "opt_out"
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return false, fmt.Errorf("begin inbound SMS transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	tag, err := tx.Exec(ctx, `
+		INSERT INTO sms_inbound_events (provider_event_id, account_id, recipient, event_type)
+		VALUES ($1, $2, $3, $4) ON CONFLICT (provider_event_id) DO NOTHING`,
+		providerEventID, accountID, recipient, eventType,
+	)
+	if err != nil {
+		return false, fmt.Errorf("record inbound SMS event: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		var existingType string
+		if err := tx.QueryRow(ctx, `
+			SELECT event_type FROM sms_inbound_events WHERE provider_event_id = $1`,
+			providerEventID,
+		).Scan(&existingType); err != nil {
+			return false, fmt.Errorf("load duplicate inbound SMS event: %w", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return false, fmt.Errorf("commit duplicate inbound SMS event: %w", err)
+		}
+		return existingType == "opt_out", nil
+	}
+	if optOut {
+		if _, err := tx.Exec(ctx, `
+			UPDATE consent_records SET withdrawn_at = now()
+			WHERE account_id = $1 AND recipient = $2 AND channel = 'sms' AND withdrawn_at IS NULL`,
+			accountID, recipient,
+		); err != nil {
+			return false, fmt.Errorf("withdraw consent after SMS opt-out: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO suppressions (account_id, recipient, channel, reason, source)
+			VALUES ($1, $2, 'sms', 'stop', 'sms_inbound')
+			ON CONFLICT (account_id, recipient, channel) DO UPDATE
+			SET reason = 'stop', source = 'sms_inbound', created_at = now()`,
+			accountID, recipient,
+		); err != nil {
+			return false, fmt.Errorf("suppress SMS opt-out: %w", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("commit inbound SMS event: %w", err)
+	}
+	return optOut, nil
+}
+
+func isSMSOptOut(text string) bool {
+	switch strings.ToUpper(strings.TrimSpace(text)) {
+	case "STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT", "REVOKE":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Store) MarkMessageFailed(ctx context.Context, messageID uuid.UUID, reason string) error {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin failed message update: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
+	if _, err := tx.Exec(ctx, `
+			UPDATE messages SET status = 'failed', updated_at = now() WHERE id = $1`, messageID); err != nil {
+		return fmt.Errorf("mark message failed: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+			INSERT INTO message_events (message_id, event_type, details)
+			VALUES ($1, 'delivery.failed', jsonb_build_object('reason', $2::text))`, messageID, reason); err != nil {
+		return fmt.Errorf("record message failure event: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit failed message update: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) SetDomainVerificationResult(
+	ctx context.Context,
+	domainID uuid.UUID,
+	verified bool,
+	verificationError string,
+) error {
+	status := "pending"
+	var verifiedAt any
+	if verified {
+		status = "verified"
+		verifiedAt = time.Now().UTC()
+	}
+	result, err := s.pool.Exec(ctx, `
+			UPDATE domains
+			SET verification_status = $2,
+			    last_verification_error = NULLIF($3, ''),
+			    last_verification_at = now(),
+			    verified_at = $4,
+			    updated_at = now()
+			WHERE id = $1`, domainID, status, verificationError, verifiedAt)
+	if err != nil {
+		return fmt.Errorf("save domain verification result: %w", err)
+	}
+	if result.RowsAffected() == 0 {
+		return pgx.ErrNoRows
+	}
+	return nil
+}
+
+func (s *Store) GetEmailJob(ctx context.Context, messageID uuid.UUID) (EmailJob, error) {
+	var job EmailJob
+	var payload []byte
+	var channels []string
+	err := s.pool.QueryRow(ctx, `
+			SELECT account_id, channels, payload
+			FROM messages
+			WHERE id = $1`, messageID,
+	).Scan(&job.AccountID, &channels, &payload)
+	if err != nil {
+		return EmailJob{}, fmt.Errorf("load message for email delivery: %w", err)
+	}
+	if !contains(channels, "email") {
+		return EmailJob{}, errors.New("message does not request email delivery")
+	}
+	var notification Notification
+	if err := json.Unmarshal(payload, &notification); err != nil {
+		return EmailJob{}, fmt.Errorf("decode stored notification payload: %w", err)
+	}
+	job.ID = messageID
+	job.Channels = channels
+	job.Recipient = notification.Recipient.Email
+	job.Subject = notification.Content.Subject
+	job.Body = notification.Content.Body
+	job.TrafficClass = notification.TrafficClass
+	return job, nil
+}
+
+func (s *Store) GetDKIMKey(ctx context.Context, accountID uuid.UUID, domainName string) (DKIMKey, error) {
+	var key DKIMKey
+	err := s.pool.QueryRow(ctx, `
+			SELECT k.selector, k.encrypted_private_key
+			FROM domains d
+			JOIN dkim_keys k ON k.domain_id = d.id
+			WHERE d.account_id = $1 AND lower(d.domain_name) = lower($2)
+			  AND d.verification_status = 'verified'`, accountID, domainName,
+	).Scan(&key.Selector, &key.EncryptedPrivateKey)
+	if err != nil {
+		return DKIMKey{}, fmt.Errorf("load verified DKIM key for %s: %w", domainName, err)
+	}
+	return key, nil
+}
+
+func (s *Store) BeginEmailDelivery(ctx context.Context, job EmailJob, provider string) error {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin email delivery: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
+	if _, err := tx.Exec(ctx, `
+			INSERT INTO email_deliveries (message_id, provider, status)
+			VALUES ($1, $2, 'sending')
+			ON CONFLICT (message_id) DO UPDATE
+			SET provider = EXCLUDED.provider, status = 'sending', error = NULL, updated_at = now()`,
+		job.ID, provider,
+	); err != nil {
+		return fmt.Errorf("record email delivery start: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+			UPDATE messages SET status = 'processing', updated_at = now() WHERE id = $1`, job.ID); err != nil {
+		return fmt.Errorf("update message to processing: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit email delivery start: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) CompleteEmailDelivery(ctx context.Context, messageID uuid.UUID, providerMessageID string) error {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin email delivery completion: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
+	tag, err := tx.Exec(ctx, `
+			UPDATE email_deliveries
+			SET status = CASE WHEN status = 'sending' THEN 'accepted' ELSE status END,
+			    provider_message_id = NULLIF($2, ''), error = NULL, updated_at = now()
+			WHERE message_id = $1`, messageID, providerMessageID)
+	if err != nil {
+		return fmt.Errorf("record delivered email: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return errors.New("email delivery record does not exist")
+	}
+	if _, err := tx.Exec(ctx, `
+			UPDATE messages SET status = 'queued', updated_at = now()
+			WHERE id = $1 AND status = 'processing'`, messageID); err != nil {
+		return fmt.Errorf("update provider-accepted message: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+			INSERT INTO message_events (message_id, event_type, details)
+			VALUES ($1, 'email.accepted_by_provider', jsonb_build_object('provider_message_id', $2::text))`,
+		messageID, providerMessageID,
+	); err != nil {
+		return fmt.Errorf("record email delivery event: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit email delivery completion: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) FailEmailDelivery(ctx context.Context, messageID uuid.UUID, deliveryError error) error {
+	_, err := s.pool.Exec(ctx, `
+			UPDATE email_deliveries SET status = 'failed', error = $2, updated_at = now()
+			WHERE message_id = $1`, messageID, deliveryError.Error())
+	if err != nil {
+		return fmt.Errorf("record failed email delivery: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ProcessEmailWebhookEvent(ctx context.Context, event EmailWebhookEvent) (bool, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return false, fmt.Errorf("begin email webhook transaction: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
+
+	var accountID uuid.UUID
+	var payload []byte
+	if err := tx.QueryRow(ctx, `
+			SELECT account_id, payload FROM messages WHERE id = $1`, event.MessageID,
+	).Scan(&accountID, &payload); err != nil {
+		return false, fmt.Errorf("load message for email webhook: %w", err)
+	}
+	var notification Notification
+	if err := json.Unmarshal(payload, &notification); err != nil {
+		return false, fmt.Errorf("decode message for email webhook: %w", err)
+	}
+	if !contains(notification.Channels, "email") ||
+		!stringsEqualFold(notification.Recipient.Email, event.Recipient) {
+		return false, errors.New("email webhook recipient does not match message")
+	}
+
+	tag, err := tx.Exec(ctx, `
+			INSERT INTO email_webhook_events (provider_event_id, message_id, recipient, event_type)
+			VALUES ($1, $2, lower($3), $4)
+			ON CONFLICT (provider_event_id) DO NOTHING`,
+		event.ProviderEventID, event.MessageID, event.Recipient, event.EventType,
+	)
+	if err != nil {
+		return false, fmt.Errorf("record email webhook event: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		if err := tx.Commit(ctx); err != nil {
+			return false, fmt.Errorf("commit duplicate webhook event: %w", err)
+		}
+		return false, nil
+	}
+	if _, err := tx.Exec(ctx, `
+			INSERT INTO message_events (message_id, event_type, details)
+			VALUES ($1, $2, jsonb_build_object('provider_event_id', $3::text, 'recipient', lower($4)))`,
+		event.MessageID, "email."+event.EventType, event.ProviderEventID, event.Recipient,
+	); err != nil {
+		return false, fmt.Errorf("record email webhook state event: %w", err)
+	}
+	if event.EventType == "bounce" || event.EventType == "complaint" {
+		reason := "hard_bounce"
+		if event.EventType == "complaint" {
+			reason = "complaint"
+		}
+		if _, err := tx.Exec(ctx, `
+				INSERT INTO suppressions (account_id, recipient, channel, reason, source)
+				VALUES ($1, lower($2), 'email', $3, 'sendgrid_webhook')
+				ON CONFLICT (account_id, recipient, channel) DO NOTHING`,
+			accountID, event.Recipient, reason,
+		); err != nil {
+			return false, fmt.Errorf("suppress email recipient: %w", err)
+		}
+	}
+	if event.EventType == "bounce" {
+		if _, err := tx.Exec(ctx, `
+				UPDATE email_deliveries SET status = 'failed', error = 'hard bounce', updated_at = now()
+				WHERE message_id = $1`, event.MessageID); err != nil {
+			return false, fmt.Errorf("mark bounced email delivery: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+				UPDATE messages SET status = 'failed', updated_at = now() WHERE id = $1`, event.MessageID); err != nil {
+			return false, fmt.Errorf("mark bounced message: %w", err)
+		}
+	}
+	if event.EventType == "delivered" {
+		if _, err := tx.Exec(ctx, `
+				UPDATE email_deliveries SET status = 'delivered', updated_at = now()
+				WHERE message_id = $1`, event.MessageID); err != nil {
+			return false, fmt.Errorf("mark email delivered: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+				UPDATE messages SET status = 'delivered', updated_at = now()
+				WHERE id = $1 AND status != 'failed'`, event.MessageID); err != nil {
+			return false, fmt.Errorf("mark message delivered: %w", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("commit email webhook event: %w", err)
+	}
+	return true, nil
+}
+
+func contains(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+func stringsEqualFold(left, right string) bool {
+	return strings.EqualFold(strings.TrimSpace(left), strings.TrimSpace(right))
+}
+
+func (s *Store) AcceptNotification(
+	ctx context.Context,
+	accountID, idempotencyKey string,
+	notification Notification,
+	request []byte,
+) (uuid.UUID, bool, error) {
+	requestHash := sha256.Sum256(request)
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return uuid.Nil, false, fmt.Errorf("begin notification transaction: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
+
+	var messageID uuid.UUID
+	err = tx.QueryRow(ctx, `
+		INSERT INTO messages (account_id, idempotency_key, event_name, channels, payload, request_hash)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (account_id, idempotency_key) DO NOTHING
+		RETURNING id`, accountID, idempotencyKey, notification.Event, notification.Channels, request, requestHash[:]).Scan(&messageID)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, false, fmt.Errorf("insert message: %w", err)
+	}
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		var existingHash []byte
+		if err := tx.QueryRow(ctx, `
+			SELECT id, request_hash
+			FROM messages
+			WHERE account_id = $1 AND idempotency_key = $2`, accountID, idempotencyKey).Scan(&messageID, &existingHash); err != nil {
+			return uuid.Nil, false, fmt.Errorf("load idempotent message: %w", err)
+		}
+		if !equalBytes(existingHash, requestHash[:]) {
+			return uuid.Nil, false, ErrIdempotencyConflict
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return uuid.Nil, false, fmt.Errorf("commit idempotent lookup: %w", err)
+		}
+		return messageID, true, nil
+	}
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO message_events (message_id, event_type, details)
+		VALUES ($1, 'accepted', '{}'::jsonb)`, messageID); err != nil {
+		return uuid.Nil, false, fmt.Errorf("record accepted message event: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO outbox (message_id, task_type)
+		VALUES ($1, 'notification:deliver')`, messageID); err != nil {
+		return uuid.Nil, false, fmt.Errorf("insert notification outbox event: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return uuid.Nil, false, fmt.Errorf("commit notification: %w", err)
+	}
+	return messageID, false, nil
+}
+
+func (s *Store) RelayOne(
+	ctx context.Context,
+	enqueue func(context.Context, uuid.UUID) error,
+) (bool, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return false, fmt.Errorf("begin outbox relay transaction: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
+
+	var messageID uuid.UUID
+	err = tx.QueryRow(ctx, `
+		SELECT message_id
+		FROM outbox
+		WHERE published_at IS NULL
+		ORDER BY created_at
+		FOR UPDATE SKIP LOCKED
+		LIMIT 1`).Scan(&messageID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if rollbackErr := tx.Rollback(ctx); rollbackErr != nil {
+			return false, fmt.Errorf("release empty outbox transaction: %w", rollbackErr)
+		}
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("select outbox row: %w", err)
+	}
+
+	if err := enqueue(ctx, messageID); err != nil {
+		return false, fmt.Errorf("enqueue message %s: %w", messageID, err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE outbox
+		SET published_at = now()
+		WHERE message_id = $1 AND published_at IS NULL`, messageID); err != nil {
+		return false, fmt.Errorf("mark outbox row published: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("commit outbox relay: %w", err)
+	}
+	return true, nil
+}
+
+func (s *Store) RunOutboxRelay(
+	ctx context.Context,
+	enqueue func(context.Context, uuid.UUID) error,
+	logger *slog.Logger,
+) {
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		published, err := s.RelayOne(ctx, enqueue)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			logger.Error("outbox relay failed", "error", err)
+			if !wait(ctx, time.Second) {
+				return
+			}
+			continue
+		}
+		if !published && !wait(ctx, 500*time.Millisecond) {
+			return
+		}
+	}
+}
+
+func wait(ctx context.Context, duration time.Duration) bool {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func equalBytes(left, right []byte) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	var diff byte
+	for i := range left {
+		diff |= left[i] ^ right[i]
+	}
+	return diff == 0
+}
