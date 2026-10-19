@@ -239,6 +239,7 @@ func newRouter(
 	router := gin.New()
 	router.Use(observability.Middleware(runtime.Metrics, logger))
 	router.Use(gin.Recovery())
+	router.GET("/openapi.yaml", serveOpenAPI)
 	router.GET("/healthz", server.health)
 	router.GET("/readyz", server.ready)
 	router.GET("/metrics", server.requireScope(apiscope.OpsRead), gin.WrapH(observability.MetricsHandler(runtime.Metrics)))

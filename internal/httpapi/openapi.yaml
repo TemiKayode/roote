@@ -1,0 +1,996 @@
+openapi: 3.1.0
+info:
+  title: Roote notification API
+  version: 1.0.0
+  description: |
+    Send email and SMS notifications with consent-aware routing, templates, delivery tracking,
+    and signed customer webhooks.
+
+    Authenticate every `/v1` request with `Authorization: Bearer <key>`. Keys starting `rt_live_`
+    send real messages; keys starting `rt_test_` create test messages that are simulated and never
+    reach a provider. Each operation lists the scope it requires.
+
+    Errors are JSON objects with an `error` message. Every response carries an `X-Request-ID`
+    header; send a UUID in that header to correlate your own logs.
+servers:
+  - url: http://localhost:8080
+    description: Local development
+security:
+  - apiKey: []
+tags:
+  - name: Notifications
+    description: Send email and SMS.
+  - name: Messages
+    description: Look up sent messages and their delivery timelines.
+  - name: Templates
+    description: Versioned, localized message templates.
+  - name: Webhooks
+    description: Signed notifications to your endpoints when delivery state changes.
+  - name: Domains
+    description: Sending domains and their SPF, DKIM, and DMARC records.
+  - name: Compliance
+    description: SMS consent, channel preferences, and suppressions.
+  - name: Operations
+    description: Queue health, dead letters, sender capacity, and metrics.
+  - name: Provider callbacks
+    description: Called by email and SMS providers, authenticated by provider signatures.
+  - name: Health
+    description: Liveness and readiness probes.
+
+paths:
+  /healthz:
+    get:
+      operationId: getHealth
+      tags: [Health]
+      summary: Liveness check
+      security: []
+      responses:
+        "200": { description: The process is running. }
+  /readyz:
+    get:
+      operationId: getReadiness
+      tags: [Health]
+      summary: Readiness check
+      description: Succeeds only when PostgreSQL and Redis respond.
+      security: []
+      responses:
+        "200": { description: Ready to serve traffic. }
+        "503": { description: A dependency is unavailable. }
+  /metrics:
+    get:
+      operationId: getMetrics
+      tags: [Operations]
+      summary: Prometheus metrics
+      description: "Scope: `ops:read` (in `api_key` mode)."
+      responses:
+        "200":
+          description: Prometheus text exposition format.
+          content: { text/plain: { schema: { type: string } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/notifications:
+    post:
+      operationId: sendNotification
+      tags: [Notifications]
+      summary: Send a notification
+      description: |
+        Scope: `notifications:write`. Accepts the notification for asynchronous delivery. Send either
+        `content` or `template`. A template is rendered on acceptance, so a missing variable is
+        reported immediately. Replaying the same `Idempotency-Key` with the same body returns the
+        original message ID with `duplicate: true`; a different body returns `409`.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, maxLength: 128 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NotificationRequest" }
+            examples:
+              content:
+                summary: Direct content
+                value:
+                  event: welcome
+                  channels: [email]
+                  recipient: { email: person@example.com }
+                  content: { subject: Welcome, body: Thanks for signing up. }
+              template:
+                summary: From a template
+                value:
+                  event: order_shipped
+                  channels: [email, sms]
+                  routing: { strategy: waterfall, order: [email, sms] }
+                  recipient: { email: person@example.com, phone: "+14155552671" }
+                  template: { key: order-shipped, locale: fr-CA, data: { name: Ada, order: A-9 } }
+      responses:
+        "202":
+          description: Accepted for delivery.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Accepted" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
+
+  /v1/messages:
+    get:
+      operationId: listMessages
+      tags: [Messages]
+      summary: Search messages
+      description: |
+        Scope: `messages:read`. Newest first. Test keys see only test messages; live keys only live
+        messages. Pass `next_cursor` back as `cursor` for the next page.
+      parameters:
+        - { name: status, in: query, schema: { $ref: "#/components/schemas/MessageStatus" } }
+        - name: recipient
+          in: query
+          description: Email address or E.164 phone number.
+          schema: { type: string }
+        - { name: since, in: query, schema: { type: string, format: date-time } }
+        - { name: until, in: query, schema: { type: string, format: date-time } }
+        - { $ref: "#/components/parameters/Limit" }
+        - { $ref: "#/components/parameters/Cursor" }
+      responses:
+        "200":
+          description: A page of messages.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [messages]
+                properties:
+                  messages:
+                    type: array
+                    items: { $ref: "#/components/schemas/MessageSummary" }
+                  next_cursor: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /v1/messages/{id}:
+    parameters:
+      - { $ref: "#/components/parameters/ID" }
+    get:
+      operationId: getMessage
+      tags: [Messages]
+      summary: Get a message with its delivery timeline
+      description: "Scope: `messages:read`. Message content is not returned."
+      responses:
+        "200":
+          description: The message.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MessageDetail" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      operationId: deleteMessage
+      tags: [Messages]
+      summary: Delete a message
+      description: |
+        Scope: `data:delete`. Removes the message, its attempts, and events. Consent, suppression,
+        and audit records are kept.
+      responses:
+        "204": { description: Deleted. }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/preferences:
+    put:
+      operationId: setPreference
+      tags: [Compliance]
+      summary: Set a recipient's channel preference
+      description: "Scope: `preferences:write`. Used by `routing.strategy: preference`."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [channel, recipient, enabled]
+              additionalProperties: false
+              properties:
+                channel: { $ref: "#/components/schemas/Channel" }
+                recipient: { type: string, description: Email address or E.164 number matching the channel. }
+                enabled: { type: boolean }
+      responses:
+        "200": { description: Saved. }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /v1/templates:
+    get:
+      operationId: listTemplates
+      tags: [Templates]
+      summary: List templates
+      description: "Scope: `templates:read`."
+      responses:
+        "200":
+          description: Templates ordered by key.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  templates:
+                    type: array
+                    items: { $ref: "#/components/schemas/Template" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      operationId: createTemplate
+      tags: [Templates]
+      summary: Create a template
+      description: "Scope: `templates:write`. A template has no content until a version is created."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [key, name]
+              additionalProperties: false
+              properties:
+                key: { $ref: "#/components/schemas/TemplateKey" }
+                name: { type: string, minLength: 1, maxLength: 200 }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Template" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /v1/templates/{key}:
+    parameters:
+      - { $ref: "#/components/parameters/TemplateKey" }
+    get:
+      operationId: getTemplate
+      tags: [Templates]
+      summary: Get a template and its version history
+      description: "Scope: `templates:read`."
+      responses:
+        "200":
+          description: The template.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: "#/components/schemas/Template" }
+                  - type: object
+                    properties:
+                      versions:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            version: { type: integer }
+                            default_locale: { type: string }
+                            created_at: { type: string, format: date-time }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/templates/{key}/versions:
+    parameters:
+      - { $ref: "#/components/parameters/TemplateKey" }
+    post:
+      operationId: createTemplateVersion
+      tags: [Templates]
+      summary: Create the next template version
+      description: |
+        Scope: `templates:write`. Versions are immutable. Content uses Go template syntax
+        (`{{.name}}`); `email_html` is HTML-escaped automatically. Syntax is checked on create.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [default_locale, contents]
+              additionalProperties: false
+              properties:
+                default_locale: { type: string, examples: [en] }
+                contents:
+                  type: object
+                  description: Content keyed by BCP 47 locale.
+                  additionalProperties: { $ref: "#/components/schemas/TemplateContent" }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  key: { type: string }
+                  version: { type: integer }
+                  default_locale: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/templates/{key}/versions/{version}:
+    parameters:
+      - { $ref: "#/components/parameters/TemplateKey" }
+      - { $ref: "#/components/parameters/TemplateVersion" }
+    get:
+      operationId: getTemplateVersion
+      tags: [Templates]
+      summary: Get a template version
+      description: "Scope: `templates:read`."
+      responses:
+        "200":
+          description: The version's contents.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  key: { type: string }
+                  version: { type: integer }
+                  default_locale: { type: string }
+                  contents:
+                    type: object
+                    additionalProperties: { $ref: "#/components/schemas/TemplateContent" }
+                  created_at: { type: string, format: date-time }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/templates/{key}/versions/{version}/publish:
+    parameters:
+      - { $ref: "#/components/parameters/TemplateKey" }
+      - { $ref: "#/components/parameters/TemplateVersion" }
+    post:
+      operationId: publishTemplateVersion
+      tags: [Templates]
+      summary: Publish a template version
+      description: "Scope: `templates:write`. Notifications that name no version use the published one."
+      responses:
+        "200": { description: Published. }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/templates/{key}/preview:
+    parameters:
+      - { $ref: "#/components/parameters/TemplateKey" }
+    post:
+      operationId: previewTemplate
+      tags: [Templates]
+      summary: Render a template without sending
+      description: "Scope: `templates:read`. Locale falls back from `fr-CA` to `fr` to the default."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                version: { type: integer, minimum: 1, description: Omit for the published version. }
+                locale: { type: string }
+                channels:
+                  type: array
+                  items: { $ref: "#/components/schemas/Channel" }
+                data: { type: object }
+      responses:
+        "200":
+          description: The rendered content.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  version: { type: integer }
+                  rendered: { $ref: "#/components/schemas/RenderedTemplate" }
+        "422": { $ref: "#/components/responses/Unprocessable" }
+
+  /v1/webhooks:
+    get:
+      operationId: listWebhooks
+      tags: [Webhooks]
+      summary: List customer webhook endpoints
+      description: "Scope: `webhooks:read`."
+      responses:
+        "200":
+          description: Endpoints, newest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  webhooks:
+                    type: array
+                    items: { $ref: "#/components/schemas/WebhookEndpoint" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      operationId: createWebhook
+      tags: [Webhooks]
+      summary: Register a webhook endpoint
+      description: |
+        Scope: `webhooks:write`. The signing secret is returned once. Each delivery is a POST with
+        `X-Roote-Event`, `X-Roote-Timestamp`, and `X-Roote-Signature: sha256=<hex>`, the HMAC-SHA256
+        of `timestamp + "." + body` under the secret. Only public HTTPS endpoints are accepted.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url, events]
+              additionalProperties: false
+              properties:
+                url: { type: string, format: uri }
+                events:
+                  type: array
+                  minItems: 1
+                  uniqueItems: true
+                  items: { $ref: "#/components/schemas/WebhookEvent" }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - { $ref: "#/components/schemas/WebhookEndpoint" }
+                  - type: object
+                    properties:
+                      signing_secret: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+  /v1/webhooks/{id}:
+    parameters:
+      - { $ref: "#/components/parameters/ID" }
+    delete:
+      operationId: deactivateWebhook
+      tags: [Webhooks]
+      summary: Deactivate a webhook endpoint
+      description: "Scope: `webhooks:write`. Pending deliveries to it are marked failed."
+      responses:
+        "204": { description: Deactivated. }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/webhooks/{id}/rotate-secret:
+    parameters:
+      - { $ref: "#/components/parameters/ID" }
+    post:
+      operationId: rotateWebhookSecret
+      tags: [Webhooks]
+      summary: Rotate a webhook signing secret
+      description: "Scope: `webhooks:write`. The new secret is returned once; the old one stops working immediately."
+      responses:
+        "200":
+          description: Rotated.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string, format: uuid }
+                  signing_secret: { type: string }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/domains:
+    get:
+      operationId: listDomains
+      tags: [Domains]
+      summary: List sending domains
+      description: "Scope: `domains:read`."
+      responses:
+        "200":
+          description: Domains, newest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  domains:
+                    type: array
+                    items: { $ref: "#/components/schemas/DomainSummary" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      operationId: createDomain
+      tags: [Domains]
+      summary: Register a sending domain
+      description: "Scope: `domains:write`. Returns the SPF, DKIM, and DMARC records to publish."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [domain]
+              additionalProperties: false
+              properties:
+                domain: { type: string, examples: [mail.example.org] }
+      responses:
+        "201":
+          description: Registered.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Domain" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /v1/domains/{id}/verify:
+    parameters:
+      - { $ref: "#/components/parameters/ID" }
+    post:
+      operationId: verifyDomain
+      tags: [Domains]
+      summary: Verify a domain's DNS records
+      description: "Scope: `domains:write`. Verification runs in the worker with retries."
+      responses:
+        "202": { description: Verification queued. }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /v1/domains/{id}/records:
+    parameters:
+      - { $ref: "#/components/parameters/ID" }
+    get:
+      operationId: getDomainRecords
+      tags: [Domains]
+      summary: Get a domain's DNS records
+      description: "Scope: `domains:read`."
+      responses:
+        "200":
+          description: The domain and its records.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Domain" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/suppressions:
+    get:
+      operationId: listSuppressions
+      tags: [Compliance]
+      summary: List suppressions
+      description: "Scope: `suppressions:read`."
+      parameters:
+        - { name: channel, in: query, schema: { $ref: "#/components/schemas/Channel" } }
+        - { name: recipient, in: query, schema: { type: string } }
+        - { $ref: "#/components/parameters/Limit" }
+        - { $ref: "#/components/parameters/Cursor" }
+      responses:
+        "200":
+          description: A page of suppressions.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  suppressions:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        channel: { $ref: "#/components/schemas/Channel" }
+                        recipient: { type: string }
+                        reason: { type: string, examples: [hard_bounce, complaint, opt_out, stop] }
+                        source: { type: string }
+                        created_at: { type: string, format: date-time }
+                  next_cursor: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    delete:
+      operationId: deleteSuppression
+      tags: [Compliance]
+      summary: Remove a hard-bounce email suppression
+      description: |
+        Scope: `suppressions:write`. Complaint suppressions (`409`) and SMS opt-outs (`400`) cannot
+        be removed through the API; SMS opt-outs clear only when new consent is recorded.
+      parameters:
+        - { name: channel, in: query, required: true, schema: { type: string, enum: [email] } }
+        - { name: recipient, in: query, required: true, schema: { type: string, format: email } }
+      responses:
+        "204": { description: Removed. }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /v1/consents/sms:
+    get:
+      operationId: listSMSConsents
+      tags: [Compliance]
+      summary: Get SMS consent history for a number
+      description: "Scope: `consents:read`."
+      parameters:
+        - { name: phone, in: query, required: true, schema: { type: string, examples: ["+14155552671"] } }
+      responses:
+        "200":
+          description: Consent records, newest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  phone: { type: string }
+                  consents:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        scope: { type: string, enum: [transactional, marketing, all] }
+                        source: { type: string }
+                        consented_at: { type: string, format: date-time }
+                        withdrawn_at: { type: string, format: date-time }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      operationId: recordSMSConsent
+      tags: [Compliance]
+      summary: Record or withdraw SMS consent
+      description: "Scope: `consents:write`. `consented: false` withdraws consent and suppresses the number."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone, scope, source, consented]
+              additionalProperties: false
+              properties:
+                phone: { type: string, description: Canonical E.164. }
+                scope: { type: string, enum: [transactional, marketing, all] }
+                source: { type: string, minLength: 1, maxLength: 200 }
+                consented: { type: boolean }
+      responses:
+        "200": { description: Recorded. }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /v1/ops/capacities:
+    put:
+      operationId: setSenderCapacity
+      tags: [Operations]
+      summary: Override a sender's warm-up capacity
+      description: "Scope: `ops:write`. Resets that sender's warm-up start date."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [channel, sender, initial_daily_limit, daily_increment, maximum_daily_limit]
+              additionalProperties: false
+              properties:
+                channel: { $ref: "#/components/schemas/Channel" }
+                sender: { type: string, maxLength: 200 }
+                initial_daily_limit: { type: integer, minimum: 1 }
+                daily_increment: { type: integer, minimum: 0 }
+                maximum_daily_limit: { type: integer, maximum: 100000000 }
+      responses:
+        "200": { description: Saved. }
+        "400": { $ref: "#/components/responses/BadRequest" }
+  /v1/ops/summary:
+    get:
+      operationId: getOperationalSummary
+      tags: [Operations]
+      summary: Operational summary
+      description: "Scope: `ops:read`. Database backlogs and per-queue Asynq counts."
+      responses:
+        "200":
+          description: The summary.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  database:
+                    type: object
+                    properties:
+                      messages_by_status: { type: object, additionalProperties: { type: integer } }
+                      pending_outbox: { type: integer }
+                      pending_webhooks: { type: integer }
+                      failed_webhooks: { type: integer }
+                      unconfirmed_email: { type: integer }
+                      unconfirmed_sms: { type: integer }
+                  queues:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name: { type: string }
+                        pending: { type: integer }
+                        active: { type: integer }
+                        scheduled: { type: integer }
+                        retry: { type: integer }
+                        archived: { type: integer }
+                        size: { type: integer }
+                        latency_seconds: { type: number }
+                        paused: { type: boolean }
+                        failed_today: { type: integer }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /v1/ops/dead-letters:
+    get:
+      operationId: listDeadLetters
+      tags: [Operations]
+      summary: List archived tasks
+      description: "Scope: `ops:read`. Payloads and provider errors are not returned."
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+      responses:
+        "200":
+          description: Archived tasks across all queues.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tasks:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        queue: { type: string }
+                        type: { type: string }
+                        retried: { type: integer }
+                        max_retry: { type: integer }
+                        last_failed_at: { type: string, format: date-time }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /v1/ops/dead-letters/{id}/retry:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, maxLength: 128 }
+    post:
+      operationId: retryDeadLetter
+      tags: [Operations]
+      summary: Retry an archived task
+      description: "Scope: `ops:write`. Retry only after fixing the cause; a retried send can duplicate."
+      responses:
+        "202": { description: Requeued. }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /internal/webhooks/email:
+    post:
+      operationId: receiveSendGridEvents
+      tags: [Provider callbacks]
+      summary: SendGrid Event Webhook
+      description: Verified with SendGrid's signed event webhook (ECDSA) headers.
+      security: []
+      responses:
+        "200": { description: Processed. }
+        "401": { description: Invalid signature. }
+  /internal/webhooks/sms/twilio:
+    post:
+      operationId: receiveTwilioWebhook
+      tags: [Provider callbacks]
+      summary: Twilio inbound message and status callback
+      description: Verified with `X-Twilio-Signature`.
+      security: []
+      responses:
+        "200": { description: Processed. }
+        "401": { description: Invalid signature. }
+  /internal/webhooks/sms/telnyx:
+    post:
+      operationId: receiveTelnyxWebhook
+      tags: [Provider callbacks]
+      summary: Telnyx messaging webhook
+      description: Verified with Telnyx's Ed25519 signature headers.
+      security: []
+      responses:
+        "200": { description: Processed. }
+        "401": { description: Invalid signature. }
+
+components:
+  securitySchemes:
+    apiKey:
+      type: http
+      scheme: bearer
+      description: An `rt_live_` or `rt_test_` API key.
+  parameters:
+    ID:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    TemplateKey:
+      name: key
+      in: path
+      required: true
+      schema: { $ref: "#/components/schemas/TemplateKey" }
+    TemplateVersion:
+      name: version
+      in: path
+      required: true
+      schema: { type: integer, minimum: 1 }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+    Cursor:
+      name: cursor
+      in: query
+      schema: { type: string }
+  responses:
+    BadRequest:
+      description: The request is invalid.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Unauthorized:
+      description: A valid API key is required.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Forbidden:
+      description: The API key lacks the required scope.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    NotFound:
+      description: Not found.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Conflict:
+      description: Conflicts with the current state.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Unprocessable:
+      description: The request is valid but cannot be carried out, for example a template that fails to render.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string }
+    Channel:
+      type: string
+      enum: [email, sms]
+    MessageStatus:
+      type: string
+      enum: [accepted, queued, processing, delivered, partially_delivered, failed]
+    WebhookEvent:
+      type: string
+      enum:
+        - notification.accepted
+        - notification.accepted_by_provider
+        - notification.delivered
+        - notification.partially_delivered
+        - notification.failed
+    TemplateKey:
+      type: string
+      pattern: "^[a-z0-9][a-z0-9_.-]{0,99}$"
+    NotificationRequest:
+      type: object
+      required: [event, channels, recipient]
+      additionalProperties: false
+      properties:
+        event: { type: string, minLength: 1, maxLength: 100 }
+        channels:
+          type: array
+          minItems: 1
+          maxItems: 2
+          uniqueItems: true
+          items: { $ref: "#/components/schemas/Channel" }
+        traffic_class: { type: string, enum: [transactional, marketing], default: transactional }
+        region: { type: string, pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$", maxLength: 63 }
+        routing:
+          type: object
+          additionalProperties: false
+          properties:
+            strategy: { type: string, enum: [explicit, preference, waterfall], default: explicit }
+            order:
+              type: array
+              description: For `waterfall`, every requested channel in the order to try.
+              items: { $ref: "#/components/schemas/Channel" }
+        recipient:
+          type: object
+          additionalProperties: false
+          properties:
+            email: { type: string, format: email }
+            phone: { type: string, description: Canonical E.164. }
+        content:
+          type: object
+          additionalProperties: false
+          properties:
+            subject: { type: string, maxLength: 255, description: Required when email is requested. }
+            body: { type: string, maxLength: 100000 }
+            html: { type: string, maxLength: 500000 }
+            sms: { type: string, maxLength: 1600, description: SMS text when it should differ from `body`. }
+        template:
+          type: object
+          required: [key]
+          additionalProperties: false
+          properties:
+            key: { $ref: "#/components/schemas/TemplateKey" }
+            version: { type: integer, minimum: 1, description: Omit for the published version. }
+            locale: { type: string }
+            data: { type: object, description: Template variables. Not stored. }
+    Accepted:
+      type: object
+      properties:
+        message_id: { type: string, format: uuid }
+        status: { type: string, const: accepted }
+        duplicate: { type: boolean }
+        test_mode: { type: boolean }
+    MessageSummary:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        event: { type: string }
+        channels: { type: array, items: { $ref: "#/components/schemas/Channel" } }
+        status: { $ref: "#/components/schemas/MessageStatus" }
+        traffic_class: { type: string }
+        region: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    MessageDetail:
+      allOf:
+        - { $ref: "#/components/schemas/MessageSummary" }
+        - type: object
+          properties:
+            routing: { type: object }
+            recipient:
+              type: object
+              properties:
+                email: { type: string }
+                phone: { type: string }
+            deliveries:
+              type: array
+              items:
+                type: object
+                properties:
+                  channel: { $ref: "#/components/schemas/Channel" }
+                  provider: { type: string }
+                  provider_message_id: { type: string }
+                  status: { type: string }
+                  error: { type: string }
+                  updated_at: { type: string, format: date-time }
+            attempts:
+              type: array
+              items:
+                type: object
+                properties:
+                  channel: { $ref: "#/components/schemas/Channel" }
+                  attempt_number: { type: integer }
+                  status: { type: string, enum: [sending, accepted, delivered, failed, skipped] }
+                  provider: { type: string }
+                  error: { type: string }
+                  started_at: { type: string, format: date-time }
+                  finished_at: { type: string, format: date-time }
+            events:
+              type: array
+              items:
+                type: object
+                properties:
+                  type: { type: string }
+                  details: { type: object }
+                  created_at: { type: string, format: date-time }
+    Template:
+      type: object
+      properties:
+        key: { $ref: "#/components/schemas/TemplateKey" }
+        name: { type: string }
+        active_version: { type: [integer, "null"] }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    TemplateContent:
+      type: object
+      additionalProperties: false
+      properties:
+        email_subject: { type: string }
+        email_text: { type: string }
+        email_html: { type: string }
+        sms_text: { type: string }
+    RenderedTemplate:
+      allOf:
+        - { $ref: "#/components/schemas/TemplateContent" }
+        - type: object
+          properties:
+            locale: { type: string }
+    WebhookEndpoint:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        url: { type: string, format: uri }
+        events: { type: array, items: { $ref: "#/components/schemas/WebhookEvent" } }
+        active: { type: boolean }
+        created_at: { type: string, format: date-time }
+    DomainSummary:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        domain: { type: string }
+        verification_status: { type: string, enum: [pending, verified, failed] }
+        last_verification_error: { type: string }
+        verified_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+    Domain:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        domain: { type: string }
+        verification_status: { type: string, enum: [pending, verified, failed] }
+        dns_records:
+          type: array
+          items:
+            type: object
+            properties:
+              name: { type: string }
+              type: { type: string, const: TXT }
+              value: { type: string }
+              purpose: { type: string }
