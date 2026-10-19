@@ -14,6 +14,17 @@ import (
 
 type Config struct {
 	HTTPPort                  int
+	MetricsPort               int
+	APIAuthMode               string
+	RetentionDays             int
+	ShutdownTimeoutSeconds    int
+	WorkerConcurrency         int
+	EmailWarmupInitialLimit   int
+	EmailWarmupDailyIncrement int
+	EmailWarmupMaximumLimit   int
+	SMSWarmupInitialLimit     int
+	SMSWarmupDailyIncrement   int
+	SMSWarmupMaximumLimit     int
 	DatabaseURL               string
 	RedisURL                  string
 	AccountID                 string
@@ -53,6 +64,53 @@ func Load() (Config, error) {
 	if err != nil || port < 1 || port > 65535 {
 		return Config{}, fmt.Errorf("APP_PORT must be an integer between 1 and 65535")
 	}
+	metricsPort, err := positiveInt("METRICS_PORT", 9090, 65535)
+	if err != nil {
+		return Config{}, err
+	}
+	retentionDays, err := positiveInt("MESSAGE_RETENTION_DAYS", 90, 3650)
+	if err != nil {
+		return Config{}, err
+	}
+	shutdownTimeout, err := positiveInt("SHUTDOWN_TIMEOUT_SECONDS", 30, 300)
+	if err != nil {
+		return Config{}, err
+	}
+	workerConcurrency, err := positiveInt("WORKER_CONCURRENCY", 10, 1000)
+	if err != nil {
+		return Config{}, err
+	}
+	emailWarmupInitial, err := positiveInt("EMAIL_WARMUP_INITIAL_LIMIT", 1000, 100_000_000)
+	if err != nil {
+		return Config{}, err
+	}
+	emailWarmupIncrement, err := nonNegativeInt("EMAIL_WARMUP_DAILY_INCREMENT", 1000, 100_000_000)
+	if err != nil {
+		return Config{}, err
+	}
+	emailWarmupMaximum, err := positiveInt("EMAIL_WARMUP_MAXIMUM_LIMIT", 100_000, 100_000_000)
+	if err != nil {
+		return Config{}, err
+	}
+	smsWarmupInitial, err := positiveInt("SMS_WARMUP_INITIAL_LIMIT", 100, 100_000_000)
+	if err != nil {
+		return Config{}, err
+	}
+	smsWarmupIncrement, err := nonNegativeInt("SMS_WARMUP_DAILY_INCREMENT", 100, 100_000_000)
+	if err != nil {
+		return Config{}, err
+	}
+	smsWarmupMaximum, err := positiveInt("SMS_WARMUP_MAXIMUM_LIMIT", 10_000, 100_000_000)
+	if err != nil {
+		return Config{}, err
+	}
+	apiAuthMode := env("API_AUTH_MODE", "api_key")
+	if apiAuthMode != "api_key" && apiAuthMode != "development" {
+		return Config{}, fmt.Errorf("API_AUTH_MODE must be api_key or development")
+	}
+	if emailWarmupMaximum < emailWarmupInitial || smsWarmupMaximum < smsWarmupInitial {
+		return Config{}, fmt.Errorf("warm-up maximum limits must be at least their initial limits")
+	}
 
 	level, err := parseLogLevel(env("LOG_LEVEL", "info"))
 	if err != nil {
@@ -88,14 +146,25 @@ func Load() (Config, error) {
 	}
 
 	cfg := Config{
-		HTTPPort:             port,
-		DatabaseURL:          strings.TrimSpace(os.Getenv("DATABASE_URL")),
-		RedisURL:             strings.TrimSpace(os.Getenv("REDIS_URL")),
-		AccountID:            strings.TrimSpace(os.Getenv("ACCOUNT_ID")),
-		AsynqQueue:           env("ASYNQ_QUEUE", "notifications"),
-		LogLevel:             level,
-		DKIMEncryptionKey:    encryptionKey,
-		WebhookEncryptionKey: webhookEncryptionKey,
+		HTTPPort:                  port,
+		MetricsPort:               metricsPort,
+		APIAuthMode:               apiAuthMode,
+		RetentionDays:             retentionDays,
+		ShutdownTimeoutSeconds:    shutdownTimeout,
+		WorkerConcurrency:         workerConcurrency,
+		EmailWarmupInitialLimit:   emailWarmupInitial,
+		EmailWarmupDailyIncrement: emailWarmupIncrement,
+		EmailWarmupMaximumLimit:   emailWarmupMaximum,
+		SMSWarmupInitialLimit:     smsWarmupInitial,
+		SMSWarmupDailyIncrement:   smsWarmupIncrement,
+		SMSWarmupMaximumLimit:     smsWarmupMaximum,
+		DatabaseURL:               strings.TrimSpace(os.Getenv("DATABASE_URL")),
+		RedisURL:                  strings.TrimSpace(os.Getenv("REDIS_URL")),
+		AccountID:                 strings.TrimSpace(os.Getenv("ACCOUNT_ID")),
+		AsynqQueue:                env("ASYNQ_QUEUE", "notifications"),
+		LogLevel:                  level,
+		DKIMEncryptionKey:         encryptionKey,
+		WebhookEncryptionKey:      webhookEncryptionKey,
 		SendGridWebhookPublicKey: strings.ReplaceAll(
 			strings.TrimSpace(os.Getenv("SENDGRID_WEBHOOK_PUBLIC_KEY")), `\n`, "\n",
 		),
@@ -269,4 +338,20 @@ func parseLogLevel(value string) (slog.Level, error) {
 	default:
 		return 0, fmt.Errorf("LOG_LEVEL must be debug, info, warn, or error")
 	}
+}
+
+func positiveInt(name string, fallback, maximum int) (int, error) {
+	value, err := strconv.Atoi(env(name, strconv.Itoa(fallback)))
+	if err != nil || value < 1 || value > maximum {
+		return 0, fmt.Errorf("%s must be an integer between 1 and %d", name, maximum)
+	}
+	return value, nil
+}
+
+func nonNegativeInt(name string, fallback, maximum int) (int, error) {
+	value, err := strconv.Atoi(env(name, strconv.Itoa(fallback)))
+	if err != nil || value < 0 || value > maximum {
+		return 0, fmt.Errorf("%s must be an integer between 0 and %d", name, maximum)
+	}
+	return value, nil
 }

@@ -11,7 +11,7 @@ Build a developer-facing, multi-channel notification platform for email and SMS.
 - **Redis + Asynq:** asynchronous task processing with retries and queue isolation.
 - **Transactional outbox:** the API writes a message and its outbox row in one PostgreSQL transaction. The worker relays outbox rows to Redis and marks them sent only after enqueue succeeds. This closes the database/queue dual-write gap. A deterministic Asynq task ID reduces duplicates if a process crashes between enqueue and marking; actual delivery handlers must still be idempotent.
 - **Explicit interfaces:** orchestration will depend on email and SMS transport interfaces, not provider SDKs.
-- **Local-first setup:** Docker Compose provides PostgreSQL, Redis, API, and worker. The API port is published on loopback only until authentication is implemented. The SMTP adapter can target a configured KumoMTA host; the MTA itself is deployed separately because its routing, signing, and TLS policy require operator-specific configuration.
+- **Local-first setup:** Docker Compose provides PostgreSQL, Redis, API, and worker. The local Compose profile explicitly uses development authentication and publishes the API on loopback only. Deployed environments must use scoped API keys. The SMTP adapter can target a configured KumoMTA host; the MTA itself is deployed separately because its routing, signing, and TLS policy require operator-specific configuration.
 - **No production claims from scaffolding:** the first milestone has no customer authentication, real delivery, consent-based routing, or provider credentials. Those are explicit later milestones, not silent fallbacks.
 
 The Go module path is `github.com/TemiKayode/roote`.
@@ -58,13 +58,15 @@ Acceptance: a valid request receives `202` and a stable message ID; replaying th
 - [x] Test route selection, fan-out, fallback, preference handling, URL restrictions, signatures, encryption, and webhook persistence.
 - [x] Apply migration 4 and verify the local Compose API/worker lifecycle.
 
-### Milestone 5 — Operations, compliance, and hardening
+### Milestone 5 — Operations, compliance, and hardening (implementation complete)
 
-- Add correlation IDs, structured logs, Prometheus metrics, readiness checks, and graceful shutdown.
-- Add IP warm-up tracking/throttling, regional routing fields, and operational dashboards/queries.
-- Review API-key hashing, revocation/scopes, encryption-key management, retention/deletion, and auditability.
-- Exercise retry exhaustion, dead-letter operations, provider outages, throughput limits, and backpressure.
-- Document deployment, secrets, backups, migrations, incident response, and provider onboarding.
+- [x] Add validated request IDs, structured request logs, Prometheus-format API/worker metrics, PostgreSQL/Redis readiness checks, and bounded graceful shutdown.
+- [x] Add durable per-sender daily warm-up limits, configurable ramp-up defaults, regional notification metadata, and operational summaries.
+- [x] Add SHA-256-hashed API keys with scopes, expiry, revocation, last-use tracking, and audit events.
+- [x] Add message retention/deletion with audit records; retain consent, suppression, and audit evidence independently.
+- [x] Expose archived Asynq tasks for scoped inspection/retry and persist terminal message state after notification retries are exhausted.
+- [x] Document authentication, provisioning, limits, queue recovery, secret handling, backups, migrations, and incident response.
+- [x] Run PostgreSQL-backed M5 lifecycle checks and deployment/runtime smoke tests before release.
 
 ## Build steps
 
@@ -74,7 +76,7 @@ Acceptance: a valid request receives `202` and a stable message ID; replaying th
 4. For actual email delivery, configure `EMAIL_TRANSPORT`, `EMAIL_FROM`, and the corresponding provider credentials. `EMAIL_TRANSPORT=disabled` is the local default; queued email tasks will be marked failed rather than silently reported as delivered.
 5. For SendGrid, configure domain authentication in SendGrid as well as publishing the service's DNS records. SendGrid signs the HTTP-submitted message with its provider-managed key; the generated key is used for SMTP delivery. Set `SENDGRID_WEBHOOK_PUBLIC_KEY` to the Event Webhook verification key to enable signed bounce/complaint callbacks. Set `EMAIL_SPF_VALUE` to the SPF value appropriate for the selected delivery path.
 6. To enable SMS, set `SMS_TRANSPORT` to `twilio` or `telnyx`, set `SMS_FROM` and `SMS_STATUS_CALLBACK_URL`, and provide the corresponding provider credentials. Twilio additionally needs `TWILIO_INBOUND_WEBHOOK_URL`; Telnyx needs `TELNYX_WEBHOOK_PUBLIC_KEY`. Configure both `SMS_COUNTRY_RATES_USD` and `SMS_COUNTRY_MONTHLY_CAPS_USD` as comma-separated `ISO=amount` pairs (for example, `US=0.01,GB=0.05`). Rates are estimated USD per SMS segment; budgets reserve that estimate for the current UTC month. The account send limit is a fixed per-minute window. Unconfigured destination countries fail closed.
-7. Configure the provider's inbound webhook to `/internal/webhooks/sms/twilio` or `/internal/webhooks/sms/telnyx`. Twilio status callbacks are generated from `SMS_STATUS_CALLBACK_URL`; set it to the matching public Twilio webhook endpoint. Telnyx delivery callbacks use that URL from each send request. Do not expose the API until customer authentication is implemented.
+7. Configure the provider's inbound webhook to `/internal/webhooks/sms/twilio` or `/internal/webhooks/sms/telnyx`. Twilio status callbacks are generated from `SMS_STATUS_CALLBACK_URL`; set it to the matching public Twilio webhook endpoint. Telnyx delivery callbacks use that URL from each send request. Provider callback routes use provider signature verification and are separate from customer API-key routes.
 8. Before sending SMS, record the recipient's explicit consent:
 
    ```powershell
@@ -117,7 +119,7 @@ Acceptance: a valid request receives `202` and a stable message ID; replaying th
      -ContentType "application/json" -Body $webhook
    ```
 
-   Webhook attempts are persisted and retried by Asynq (up to eight retries). Endpoint registration is not authenticated in this development milestone; do not expose it publicly.
+   Webhook attempts are persisted and retried by Asynq (up to eight retries). The examples here use the loopback-only development mode. Deployed environments must set `API_AUTH_MODE=api_key` and send a scoped bearer key to every `/v1/*` customer or operations route.
 
 11. Start services with `docker compose up --build`.
 12. Check `http://localhost:8080/healthz` and `http://localhost:8080/readyz`.
@@ -152,13 +154,67 @@ Acceptance: a valid request receives `202` and a stable message ID; replaying th
 17. Run local checks with `go test ./...` and `go vet ./...`. PostgreSQL-backed SMS and orchestration/webhook store lifecycle tests require `TEST_DATABASE_URL` pointing at a disposable PostgreSQL database; run `go test ./internal/store -count=1`.
 18. Stop the stack with `docker compose down`. PostgreSQL data is persisted in a named volume; removing it is destructive and is not part of routine shutdown.
 
+## Milestone 5 operations
+
+### Authentication and key lifecycle
+
+`API_AUTH_MODE` defaults to `api_key` in the binary. The checked-in Compose configuration and `.env.example` deliberately choose `development` for local, loopback-only testing; this mode bypasses API-key checks and must never be used for a public deployment. Set `API_AUTH_MODE=api_key` before exposing an environment.
+
+Provision a least-privilege key from the configured account. The plaintext token is printed once and is never stored; only its SHA-256 hash is persisted. Do not copy it into shell history, logs, tickets, or source control.
+
+```powershell
+docker compose run --rm --no-deps --entrypoint /app/admin api create-key `
+  --name service-integration `
+  --scopes notifications:write,domains:read `
+  --expires-in 720h
+```
+
+Scopes are `notifications:write`, `preferences:write`, `webhooks:write`, `domains:read`, `domains:write`, `ops:read`, `ops:write`, and `data:delete`. `*` grants every scope and cannot be combined with other scopes. Expiry is optional; when set, it must be no longer than ten years. Rotate keys by creating a replacement, deploying it to the client, verifying usage, then revoking the old key:
+
+```powershell
+docker compose run --rm --no-deps --entrypoint /app/admin api revoke-key --id <key-uuid>
+```
+
+The API keys created by this CLI belong to the configured `ACCOUNT_ID`; account provisioning and multi-tenant account administration are not provided. API keys authenticate the calling service, not an end-user's consent.
+
+### Monitoring and queue recovery
+
+- `GET /metrics` on the API and the worker's internal `METRICS_PORT` expose Prometheus text metrics. API metrics include low-cardinality method/route/status counters and latency histograms; worker metrics count completed/failed tasks by fixed task type.
+- `/readyz` requires both PostgreSQL and Redis to respond. `/healthz` is a liveness check only.
+- `GET /v1/ops/summary` (scope `ops:read`) reports database delivery/webhook backlogs and Asynq queue depth, retry, and archive counts.
+- `GET /v1/ops/dead-letters?limit=50` lists archived tasks without returning payloads or provider error strings. `POST /v1/ops/dead-letters/{task-id}/retry` (scope `ops:write`) requeues one archived task and writes an audit event. Retry only after correcting the underlying provider/configuration issue; provider acceptance followed by a crash can cause a duplicate delivery.
+- Notification retries exhausted by Asynq are persisted as failed or partially delivered and emit the normal terminal customer notification event. Webhook tasks have their own durable delivery status and bounded retries. Investigate archived domain-verification tasks before manually retrying them.
+- Outbox writes are durable in PostgreSQL; if Redis is unavailable, readiness fails and the worker relay retries later. Do not purge Redis to recover an outage. Inspect the queue summary and application logs, restore Redis connectivity, then retry only archived work that is safe to repeat.
+
+### Sender warm-up, region, and retention
+
+The first send for each `(account, channel, sender identity)` creates a durable daily capacity rule using these configurable defaults: email starts at 1,000/day and adds 1,000/day up to 100,000/day; SMS starts at 100/day and adds 100/day up to 10,000/day. SendGrid identities use the configured transactional or marketing IP pool when present; otherwise email uses the sending domain. SMS identities include provider, configured sender, and destination country. Counts are per UTC database date and include provider attempts, including transient failures. A full capacity returns the task for retry rather than sending past the limit. Operator overrides use `PUT /v1/ops/capacities` with scope `ops:write`; each override resets that identity's warm-up start date, for example:
+
+```json
+{"channel":"email","sender":"sendgrid:ip-pool:transactional-pool","initial_daily_limit":200,"daily_increment":100,"maximum_daily_limit":2000}
+```
+
+The existing SMS account minute-rate and country monthly USD budgets remain additional limits. `region` is an optional validated notification field persisted with each message; it is metadata for regional policies, not automatic cross-region routing.
+
+`MESSAGE_RETENTION_DAYS` defaults to 90 and controls periodic deletion of old message records in batches. Message content, delivery attempts, and message events are removed; consent records, suppressions, and audit events are retained. A caller with `data:delete` can delete one message with `DELETE /v1/messages/{message-id}`. Every explicit deletion and each non-empty retention purge is audited. Set the retention period to match applicable legal/customer requirements before deployment.
+
+### Secrets, backups, deployment, and incidents
+
+- Supply provider credentials and the 32-byte DKIM/webhook encryption keys through a secret manager. Restrict access and preserve encrypted backups of those keys separately from the database backup. Rotating either encryption key without re-encrypting stored values makes existing stored secrets unreadable; this release does not implement online encryption-key rotation.
+- Back up PostgreSQL before applying migrations or changing retention settings. Test restoration of the database and encryption keys together. The Asynq queue is Redis-backed; keep Redis persistence enabled and monitor readiness, queue latency, retry counts, and archived tasks.
+- Database migrations are versioned and applied on service startup. Roll out API and worker binaries that contain the same migration set; take a backup first and avoid concurrent incompatible releases.
+- For a provider outage, pause provider-side sending if possible, verify provider status/credentials, monitor queue growth and SMS budgets, and allow configured retries to resume when healthy. Avoid manually retrying tasks until the cause is fixed.
+- For suspected API-key exposure, revoke the key with the admin command, provision a replacement with only required scopes, and review the `audit_events` table plus API request logs. The token itself is not recoverable from the database.
+- For a customer data deletion request, use the scoped delete endpoint and verify the message is absent. Retention and explicit deletion remove message data but intentionally preserve consent/suppression and audit evidence; follow the applicable legal process if those records also require removal.
+
 ## Current limitations and next decisions
 
-- The development account ID is configured through `ACCOUNT_ID`; authentication and tenant isolation must be implemented before exposing this service publicly.
+- The API is authenticated in `api_key` mode, but account provisioning and customer self-service are not implemented; API keys created by the admin CLI are bound to the configured `ACCOUNT_ID`.
 - Email-only, SMS-only, and mixed-channel requests are supported. A provider's later delivery failure does not trigger waterfall fallback after that provider has already accepted the message.
-- Customer authentication and tenant authorization remain future work. Preference, consent, and webhook endpoint APIs currently use the configured development account and must not be exposed publicly. Consent submitted through the development API is not independently verified; integrate authenticated consent capture before production.
+- The local `development` auth mode intentionally bypasses API keys and is safe only for loopback-only development. Consent submitted by an authenticated API client is still an assertion by that client; it is not independent proof of end-user consent. Integrate verified consent capture before production.
 - SMS country prices are operator-provided estimates and budget reservations, not reconciled provider invoices. Update rates and caps whenever provider pricing changes; current-period estimates should be reconciled operationally.
 - The SMTP adapter signs messages with the stored DKIM key. For SendGrid, configure SendGrid's own domain authentication records; provider signing is not performed with the private key stored here.
 - Exactly-once delivery cannot be guaranteed across a provider acceptance followed by a process crash before PostgreSQL records the response. Providers may accept a retry as a duplicate; this remains an at-least-once system.
 - Configure secrets from a secret manager in deployed environments; never reuse `.env.example` credentials.
-- Before production, choose deployment region/provider, retention policy, and managed key-rotation/recovery procedures.
+- Regional notification metadata is persisted but does not itself select a region or route traffic across regions. Configure and test external regional isolation before relying on it.
+- Before production, choose deployment region/provider, set a retention policy, and establish managed key-rotation/recovery procedures.

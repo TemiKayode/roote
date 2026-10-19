@@ -10,6 +10,7 @@ require (
 	github.com/jackc/pgx/v5 v5.7.5
 	github.com/nyaruka/phonenumbers v1.8.1
 	github.com/pressly/goose/v3 v3.24.1
+	github.com/redis/go-redis/v9 v9.7.0
 	github.com/wneessen/go-mail v0.7.2
 )
 
@@ -39,7 +40,6 @@ require (
 	github.com/pelletier/go-toml/v2 v2.2.4 // indirect
 	github.com/quic-go/qpack v0.5.1 // indirect
 	github.com/quic-go/quic-go v0.54.0 // indirect
-	github.com/redis/go-redis/v9 v9.7.0 // indirect
 	github.com/robfig/cron/v3 v3.0.1 // indirect
 	github.com/sethvargo/go-retry v0.3.0 // indirect
 	github.com/spf13/cast v1.7.0 // indirect

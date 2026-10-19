@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/pressly/goose/v3"
@@ -29,6 +30,7 @@ var (
 	ErrSMSRateLimit        = errors.New("SMS account rate limit exceeded")
 	ErrSMSCountryBudget    = errors.New("SMS country monthly budget exceeded")
 	ErrSMSConsentRequired  = errors.New("active SMS consent is required")
+	ErrSenderCapacity      = errors.New("sender daily warm-up capacity exceeded")
 )
 
 type Store struct {
@@ -39,6 +41,7 @@ type Notification struct {
 	Event        string   `json:"event"`
 	Channels     []string `json:"channels"`
 	TrafficClass string   `json:"traffic_class,omitempty"`
+	Region       string   `json:"region,omitempty"`
 	Routing      Routing  `json:"routing,omitempty"`
 	Recipient    struct {
 		Email string `json:"email,omitempty"`
@@ -87,6 +90,7 @@ type Domain struct {
 type EmailJob struct {
 	ID           uuid.UUID
 	AccountID    uuid.UUID
+	Region       string
 	Channels     []string
 	Recipient    string
 	Subject      string
@@ -98,6 +102,7 @@ type EmailJob struct {
 type SMSJob struct {
 	ID           uuid.UUID
 	AccountID    uuid.UUID
+	Region       string
 	Channels     []string
 	Recipient    string
 	Body         string
@@ -124,6 +129,29 @@ type SMSWebhookEvent struct {
 	MessageID         uuid.UUID
 	Recipient         string
 	EventType         string
+}
+
+type APIKey struct {
+	ID        uuid.UUID
+	AccountID uuid.UUID
+	Scopes    []string
+}
+
+type AuditEvent struct {
+	AccountID  uuid.UUID
+	APIKeyID   *uuid.UUID
+	Action     string
+	Resource   string
+	ResourceID string
+	RequestID  string
+	Details    any
+}
+
+type OperationalSummary struct {
+	MessagesByStatus map[string]int64 `json:"messages_by_status"`
+	PendingOutbox    int64            `json:"pending_outbox"`
+	PendingWebhooks  int64            `json:"pending_webhooks"`
+	FailedWebhooks   int64            `json:"failed_webhooks"`
 }
 
 func Open(ctx context.Context, databaseURL, accountID string) (*Store, error) {
@@ -209,6 +237,305 @@ func (s *Store) Ping(ctx context.Context) error {
 		return fmt.Errorf("ping PostgreSQL: %w", err)
 	}
 	return nil
+}
+
+func (s *Store) CreateAPIKey(
+	ctx context.Context,
+	accountID uuid.UUID,
+	name string,
+	hash []byte,
+	scopes []string,
+	expiresAt *time.Time,
+) (uuid.UUID, error) {
+	var id uuid.UUID
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("begin API key creation: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := tx.QueryRow(ctx, `
+			INSERT INTO api_keys (account_id, key_hash, name, scopes, expires_at)
+			VALUES ($1, $2, $3, $4, $5)
+			RETURNING id`, accountID, hash, name, scopes, expiresAt,
+	).Scan(&id); err != nil {
+		return uuid.Nil, fmt.Errorf("create API key: %w", err)
+	}
+	if err := insertAuditEvent(ctx, tx, AuditEvent{
+		AccountID: accountID, Action: "api_key.created", Resource: "api_key",
+		ResourceID: id.String(), Details: map[string]any{"name": name, "scopes": scopes},
+	}); err != nil {
+		return uuid.Nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return uuid.Nil, fmt.Errorf("commit API key creation: %w", err)
+	}
+	return id, nil
+}
+
+func (s *Store) RevokeAPIKey(ctx context.Context, accountID, keyID uuid.UUID) error {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin API key revocation: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	tag, err := tx.Exec(ctx, `
+			UPDATE api_keys SET revoked_at = COALESCE(revoked_at, now())
+			WHERE id = $1 AND account_id = $2`, keyID, accountID)
+	if err != nil {
+		return fmt.Errorf("revoke API key: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return pgx.ErrNoRows
+	}
+	if err := insertAuditEvent(ctx, tx, AuditEvent{
+		AccountID: accountID, Action: "api_key.revoked", Resource: "api_key",
+		ResourceID: keyID.String(),
+	}); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit API key revocation: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) AuthenticateAPIKey(ctx context.Context, hash []byte) (APIKey, error) {
+	var key APIKey
+	err := s.pool.QueryRow(ctx, `
+			UPDATE api_keys
+			SET last_used_at = now()
+			WHERE key_hash = $1 AND revoked_at IS NULL
+			  AND (expires_at IS NULL OR expires_at > now())
+			RETURNING id, account_id, scopes`, hash,
+	).Scan(&key.ID, &key.AccountID, &key.Scopes)
+	if err != nil {
+		return APIKey{}, fmt.Errorf("authenticate API key: %w", err)
+	}
+	return key, nil
+}
+
+func (s *Store) RecordAuditEvent(ctx context.Context, event AuditEvent) error {
+	if err := insertAuditEvent(ctx, s.pool, event); err != nil {
+		return err
+	}
+	return nil
+}
+
+type auditExecer interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}
+
+func insertAuditEvent(ctx context.Context, execer auditExecer, event AuditEvent) error {
+	details, err := json.Marshal(event.Details)
+	if err != nil {
+		return fmt.Errorf("encode audit event details: %w", err)
+	}
+	_, err = execer.Exec(ctx, `
+			INSERT INTO audit_events
+				(account_id, api_key_id, action, resource_type, resource_id, request_id, details)
+			VALUES ($1, $2, $3, $4, NULLIF($5, ''), NULLIF($6, ''), $7::jsonb)`,
+		event.AccountID, event.APIKeyID, event.Action, event.Resource, event.ResourceID,
+		event.RequestID, string(details),
+	)
+	if err != nil {
+		return fmt.Errorf("record audit event %q: %w", event.Action, err)
+	}
+	return nil
+}
+
+func (s *Store) SetSenderCapacity(
+	ctx context.Context,
+	accountID uuid.UUID,
+	channel, sender string,
+	initialLimit, dailyIncrement, maximumLimit int,
+) error {
+	_, err := s.pool.Exec(ctx, `
+			INSERT INTO sender_capacities
+				(account_id, channel, sender, initial_daily_limit, daily_increment, maximum_daily_limit)
+			VALUES ($1, $2, $3, $4, $5, $6)
+			ON CONFLICT (account_id, channel, sender) DO UPDATE SET
+				initial_daily_limit = EXCLUDED.initial_daily_limit,
+				daily_increment = EXCLUDED.daily_increment,
+				maximum_daily_limit = EXCLUDED.maximum_daily_limit,
+				started_at = (now() AT TIME ZONE 'UTC')::date,
+				updated_at = now()`,
+		accountID, channel, sender, initialLimit, dailyIncrement, maximumLimit,
+	)
+	if err != nil {
+		return fmt.Errorf("set sender capacity: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ReserveSenderCapacity(
+	ctx context.Context,
+	accountID uuid.UUID,
+	channel, sender string,
+	initialLimit, dailyIncrement, maximumLimit int,
+) error {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin sender capacity reservation: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `
+			INSERT INTO sender_capacities
+				(account_id, channel, sender, initial_daily_limit, daily_increment, maximum_daily_limit)
+			VALUES ($1, $2, $3, $4, $5, $6)
+			ON CONFLICT (account_id, channel, sender) DO NOTHING`,
+		accountID, channel, sender, initialLimit, dailyIncrement, maximumLimit,
+	); err != nil {
+		return fmt.Errorf("initialize sender capacity: %w", err)
+	}
+	var effectiveLimit int
+	if err := tx.QueryRow(ctx, `
+			SELECT LEAST(maximum_daily_limit::bigint,
+				initial_daily_limit::bigint +
+					GREATEST((now() AT TIME ZONE 'UTC')::date - started_at, 0)::bigint *
+					daily_increment::bigint)::integer
+			FROM sender_capacities
+			WHERE account_id = $1 AND channel = $2 AND sender = $3
+			FOR UPDATE`, accountID, channel, sender,
+	).Scan(&effectiveLimit); err != nil {
+		return fmt.Errorf("load sender warm-up capacity: %w", err)
+	}
+	tag, err := tx.Exec(ctx, `
+			INSERT INTO sender_capacity_usage (account_id, channel, sender, usage_date, reserved)
+			VALUES ($1, $2, $3, (now() AT TIME ZONE 'UTC')::date, 1)
+			ON CONFLICT (account_id, channel, sender, usage_date) DO UPDATE
+			SET reserved = sender_capacity_usage.reserved + 1
+			WHERE sender_capacity_usage.reserved < $4`,
+		accountID, channel, sender, effectiveLimit,
+	)
+	if err != nil {
+		return fmt.Errorf("reserve sender daily capacity: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrSenderCapacity
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit sender capacity reservation: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ReleaseSenderCapacity(
+	ctx context.Context,
+	accountID uuid.UUID,
+	channel, sender string,
+) error {
+	_, err := s.pool.Exec(ctx, `
+			UPDATE sender_capacity_usage SET reserved = reserved - 1
+			WHERE account_id = $1 AND channel = $2 AND sender = $3
+			  AND usage_date = (now() AT TIME ZONE 'UTC')::date AND reserved > 0`,
+		accountID, channel, sender,
+	)
+	if err != nil {
+		return fmt.Errorf("release sender daily capacity: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) OperationalSummary(ctx context.Context, accountID uuid.UUID) (OperationalSummary, error) {
+	summary := OperationalSummary{
+		MessagesByStatus: make(map[string]int64),
+	}
+	rows, err := s.pool.Query(ctx, `
+			SELECT status, count(*) FROM messages
+			WHERE account_id = $1 GROUP BY status`, accountID)
+	if err != nil {
+		return OperationalSummary{}, fmt.Errorf("query message status counts: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var status string
+		var count int64
+		if err := rows.Scan(&status, &count); err != nil {
+			return OperationalSummary{}, fmt.Errorf("scan message status count: %w", err)
+		}
+		summary.MessagesByStatus[status] = count
+	}
+	if err := rows.Err(); err != nil {
+		return OperationalSummary{}, fmt.Errorf("iterate message status counts: %w", err)
+	}
+	err = s.pool.QueryRow(ctx, `
+			SELECT
+				(SELECT count(*) FROM outbox o JOIN messages m ON m.id = o.message_id
+				 WHERE m.account_id = $1 AND o.published_at IS NULL),
+				(SELECT count(*) FROM webhook_deliveries d
+				 JOIN webhook_endpoints e ON e.id = d.endpoint_id
+				 WHERE e.account_id = $1 AND d.status = 'pending'),
+				(SELECT count(*) FROM webhook_deliveries d
+				 JOIN webhook_endpoints e ON e.id = d.endpoint_id
+				 WHERE e.account_id = $1 AND d.status = 'failed')`,
+		accountID,
+	).Scan(&summary.PendingOutbox, &summary.PendingWebhooks, &summary.FailedWebhooks)
+	if err != nil {
+		return OperationalSummary{}, fmt.Errorf("query operational queue summary: %w", err)
+	}
+	return summary, nil
+}
+
+func (s *Store) DeleteMessage(ctx context.Context, accountID, messageID uuid.UUID, requestID string, keyID *uuid.UUID) error {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin message deletion: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	tag, err := tx.Exec(ctx, `DELETE FROM messages WHERE id = $1 AND account_id = $2`, messageID, accountID)
+	if err != nil {
+		return fmt.Errorf("delete message: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return pgx.ErrNoRows
+	}
+	if err := insertAuditEvent(ctx, tx, AuditEvent{
+		AccountID: accountID, APIKeyID: keyID, Action: "message.deleted",
+		Resource: "message", ResourceID: messageID.String(), RequestID: requestID,
+	}); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit message deletion: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) PurgeExpiredMessages(ctx context.Context, accountID uuid.UUID, retentionDays int) (int64, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return 0, fmt.Errorf("begin message retention purge: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var deleted int64
+	if err := tx.QueryRow(ctx, `
+			WITH expired AS (
+				SELECT id FROM messages
+				WHERE account_id = $1 AND created_at < now() - make_interval(days => $2)
+				ORDER BY created_at
+				LIMIT 1000
+				FOR UPDATE SKIP LOCKED
+			), removed AS (
+				DELETE FROM messages
+				WHERE id IN (SELECT id FROM expired)
+				RETURNING id
+			)
+			SELECT count(*) FROM removed`, accountID, retentionDays,
+	).Scan(&deleted); err != nil {
+		return 0, fmt.Errorf("purge expired messages: %w", err)
+	}
+	if deleted > 0 {
+		if err := insertAuditEvent(ctx, tx, AuditEvent{
+			AccountID: accountID, Action: "messages.retention_purged", Resource: "message",
+			Details: map[string]any{"deleted_count": deleted, "retention_days": retentionDays},
+		}); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("commit message retention purge: %w", err)
+	}
+	return deleted, nil
 }
 
 func (s *Store) CreateDomain(
@@ -314,6 +641,7 @@ func (s *Store) GetSMSJob(ctx context.Context, messageID uuid.UUID) (SMSJob, err
 	job.Recipient = notification.Recipient.Phone
 	job.Body = notification.Content.Body
 	job.TrafficClass = notification.TrafficClass
+	job.Region = notification.Region
 	job.Routing = notification.Routing
 	return job, nil
 }
@@ -391,8 +719,9 @@ func (s *Store) CreateWebhookDeliveries(
 		return fmt.Errorf("encode customer webhook payload: %w", err)
 	}
 	_, err = tx.Exec(ctx, `
-		INSERT INTO webhook_deliveries (endpoint_id, event_type, payload, source_id)
-		SELECT id, $2, $3, $4
+		INSERT INTO webhook_deliveries
+			(endpoint_id, event_type, payload, source_id, source_message_id)
+		SELECT id, $2, $3, $4, $1
 		FROM webhook_endpoints
 		WHERE account_id = (SELECT account_id FROM messages WHERE id = $1)
 		  AND active = true AND $2 = ANY(subscribed_events)
@@ -1174,6 +1503,50 @@ func (s *Store) MarkMessageFailed(ctx context.Context, messageID uuid.UUID, reas
 	return nil
 }
 
+func (s *Store) FailMessageRetriesExhausted(
+	ctx context.Context,
+	messageID uuid.UUID,
+	retries, maximumRetries int,
+) error {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin retry exhaustion update: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var lockedID uuid.UUID
+	if err := tx.QueryRow(ctx, `
+		SELECT id FROM messages WHERE id = $1 FOR UPDATE`, messageID,
+	).Scan(&lockedID); err != nil {
+		return fmt.Errorf("lock message after retry exhaustion: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE messages
+		SET status = CASE WHEN
+			EXISTS (SELECT 1 FROM delivery_attempts WHERE message_id = $1 AND status = 'delivered')
+			OR EXISTS (SELECT 1 FROM email_deliveries WHERE message_id = $1 AND status = 'delivered')
+			OR EXISTS (SELECT 1 FROM sms_deliveries WHERE message_id = $1 AND status = 'delivered')
+			THEN 'partially_delivered' ELSE 'failed' END,
+			updated_at = now()
+		WHERE id = $1`, messageID); err != nil {
+		return fmt.Errorf("mark retry-exhausted message terminal: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO message_events (message_id, event_type, details)
+		VALUES ($1, 'delivery.retry_exhausted',
+			jsonb_build_object('retry_count', $2::integer, 'max_retries', $3::integer))`,
+		messageID, retries, maximumRetries,
+	); err != nil {
+		return fmt.Errorf("record notification retry exhaustion: %w", err)
+	}
+	if err := emitTerminalNotificationEvent(ctx, tx, s, messageID); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit retry exhaustion update: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) RecordChannelFailure(
 	ctx context.Context,
 	messageID uuid.UUID,
@@ -1371,6 +1744,7 @@ func (s *Store) GetEmailJob(ctx context.Context, messageID uuid.UUID) (EmailJob,
 	job.Subject = notification.Content.Subject
 	job.Body = notification.Content.Body
 	job.TrafficClass = notification.TrafficClass
+	job.Region = notification.Region
 	job.Routing = notification.Routing
 	return job, nil
 }
@@ -1663,10 +2037,12 @@ func (s *Store) AcceptNotification(
 
 	var messageID uuid.UUID
 	err = tx.QueryRow(ctx, `
-		INSERT INTO messages (account_id, idempotency_key, event_name, channels, payload, request_hash)
-		VALUES ($1, $2, $3, $4, $5, $6)
+		INSERT INTO messages
+			(account_id, idempotency_key, event_name, channels, payload, request_hash, region)
+		VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, ''))
 		ON CONFLICT (account_id, idempotency_key) DO NOTHING
-		RETURNING id`, accountID, idempotencyKey, notification.Event, notification.Channels, request, requestHash[:]).Scan(&messageID)
+		RETURNING id`, accountID, idempotencyKey, notification.Event, notification.Channels,
+		request, requestHash[:], notification.Region).Scan(&messageID)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return uuid.Nil, false, fmt.Errorf("insert message: %w", err)
 	}

@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -14,16 +15,19 @@ import (
 	"net/url"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/hibiken/asynq"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/nyaruka/phonenumbers"
 
 	"github.com/TemiKayode/roote/internal/emaildomain"
+	"github.com/TemiKayode/roote/internal/observability"
 	securesecret "github.com/TemiKayode/roote/internal/secret"
 	"github.com/TemiKayode/roote/internal/smswebhook"
 	"github.com/TemiKayode/roote/internal/store"
@@ -31,6 +35,7 @@ import (
 
 var (
 	domainPattern = regexp.MustCompile(`^(?i)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$`)
+	regionPattern = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
 )
 
 type NotificationStore interface {
@@ -67,6 +72,27 @@ type OrchestrationStore interface {
 
 type CustomerWebhookStore interface {
 	CreateWebhookEndpoint(context.Context, uuid.UUID, string, []byte, []string) (uuid.UUID, error)
+}
+
+type APIKeyAuthenticator interface {
+	AuthenticateAPIKey(context.Context, []byte) (store.APIKey, error)
+}
+
+type AuditStore interface {
+	RecordAuditEvent(context.Context, store.AuditEvent) error
+	OperationalSummary(context.Context, uuid.UUID) (store.OperationalSummary, error)
+	SetSenderCapacity(context.Context, uuid.UUID, string, string, int, int, int) error
+	DeleteMessage(context.Context, uuid.UUID, uuid.UUID, string, *uuid.UUID) error
+}
+
+type RuntimeFeatures struct {
+	AuthMode   string
+	APIKeys    APIKeyAuthenticator
+	AuditStore AuditStore
+	ReadyCheck func(context.Context) error
+	Metrics    *observability.Metrics
+	Inspector  *asynq.Inspector
+	QueueName  string
 }
 
 type EmailFeatures struct {
@@ -111,6 +137,13 @@ type Server struct {
 	orchestrationStore         OrchestrationStore
 	webhookStore               CustomerWebhookStore
 	webhookEncryptionKey       []byte
+	authMode                   string
+	apiKeys                    APIKeyAuthenticator
+	auditStore                 AuditStore
+	readyCheck                 func(context.Context) error
+	metrics                    *observability.Metrics
+	inspector                  *asynq.Inspector
+	queueName                  string
 }
 
 func New(logger *slog.Logger, accountID string, notificationStore NotificationStore) *gin.Engine {
@@ -123,7 +156,7 @@ func NewWithEmail(
 	notificationStore NotificationStore,
 	emailFeatures EmailFeatures,
 ) *gin.Engine {
-	return newRouter(logger, accountID, notificationStore, emailFeatures, SMSFeatures{}, CustomerWebhookFeatures{})
+	return newRouter(logger, accountID, notificationStore, emailFeatures, SMSFeatures{}, CustomerWebhookFeatures{}, RuntimeFeatures{})
 }
 
 func NewWithFeatures(
@@ -133,7 +166,7 @@ func NewWithFeatures(
 	emailFeatures EmailFeatures,
 	smsFeatures SMSFeatures,
 ) *gin.Engine {
-	return newRouter(logger, accountID, notificationStore, emailFeatures, smsFeatures, CustomerWebhookFeatures{})
+	return newRouter(logger, accountID, notificationStore, emailFeatures, smsFeatures, CustomerWebhookFeatures{}, RuntimeFeatures{})
 }
 
 func NewWithAllFeatures(
@@ -144,7 +177,19 @@ func NewWithAllFeatures(
 	smsFeatures SMSFeatures,
 	webhookFeatures CustomerWebhookFeatures,
 ) *gin.Engine {
-	return newRouter(logger, accountID, notificationStore, emailFeatures, smsFeatures, webhookFeatures)
+	return NewWithRuntime(logger, accountID, notificationStore, emailFeatures, smsFeatures, webhookFeatures, RuntimeFeatures{})
+}
+
+func NewWithRuntime(
+	logger *slog.Logger,
+	accountID string,
+	notificationStore NotificationStore,
+	emailFeatures EmailFeatures,
+	smsFeatures SMSFeatures,
+	webhookFeatures CustomerWebhookFeatures,
+	runtime RuntimeFeatures,
+) *gin.Engine {
+	return newRouter(logger, accountID, notificationStore, emailFeatures, smsFeatures, webhookFeatures, runtime)
 }
 
 func newRouter(
@@ -154,7 +199,11 @@ func newRouter(
 	emailFeatures EmailFeatures,
 	smsFeatures SMSFeatures,
 	webhookFeatures CustomerWebhookFeatures,
+	runtime RuntimeFeatures,
 ) *gin.Engine {
+	if runtime.Metrics == nil {
+		runtime.Metrics = observability.NewMetrics()
+	}
 	server := &Server{
 		store:                      notificationStore,
 		accountID:                  accountID,
@@ -174,17 +223,31 @@ func newRouter(
 		orchestrationStore:         orchestrationStoreFrom(notificationStore),
 		webhookStore:               webhookFeatures.Store,
 		webhookEncryptionKey:       webhookFeatures.EncryptionKey,
+		authMode:                   runtime.AuthMode,
+		apiKeys:                    runtime.APIKeys,
+		auditStore:                 runtime.AuditStore,
+		readyCheck:                 runtime.ReadyCheck,
+		metrics:                    runtime.Metrics,
+		inspector:                  runtime.Inspector,
+		queueName:                  runtime.QueueName,
 	}
 	router := gin.New()
+	router.Use(observability.Middleware(runtime.Metrics, logger))
 	router.Use(gin.Recovery())
 	router.GET("/healthz", server.health)
 	router.GET("/readyz", server.ready)
-	router.POST("/v1/notifications", server.createNotification)
-	router.PUT("/v1/preferences", server.setNotificationPreference)
-	router.POST("/v1/webhooks", server.createCustomerWebhook)
-	router.POST("/v1/domains", server.createDomain)
-	router.POST("/v1/domains/:id/verify", server.verifyDomain)
-	router.GET("/v1/domains/:id/records", server.domainRecords)
+	router.GET("/metrics", gin.WrapH(observability.MetricsHandler(runtime.Metrics)))
+	router.POST("/v1/notifications", server.requireScope("notifications:write"), server.createNotification)
+	router.PUT("/v1/preferences", server.requireScope("preferences:write"), server.setNotificationPreference)
+	router.POST("/v1/webhooks", server.requireScope("webhooks:write"), server.createCustomerWebhook)
+	router.POST("/v1/domains", server.requireScope("domains:write"), server.createDomain)
+	router.POST("/v1/domains/:id/verify", server.requireScope("domains:write"), server.verifyDomain)
+	router.GET("/v1/domains/:id/records", server.requireScope("domains:read"), server.domainRecords)
+	router.PUT("/v1/ops/capacities", server.requireScope("ops:write"), server.setCapacity)
+	router.GET("/v1/ops/summary", server.requireScope("ops:read"), server.operationalSummary)
+	router.GET("/v1/ops/dead-letters", server.requireScope("ops:read"), server.listDeadLetters)
+	router.POST("/v1/ops/dead-letters/:id/retry", server.requireScope("ops:write"), server.retryDeadLetter)
+	router.DELETE("/v1/messages/:id", server.requireScope("data:delete"), server.deleteMessage)
 	router.POST("/internal/webhooks/email", server.sendGridWebhook)
 	router.POST("/v1/consents/sms", server.recordSMSConsent)
 	router.POST("/internal/webhooks/sms/twilio", server.twilioSMSWebhook)
@@ -202,12 +265,313 @@ func (s *Server) health(c *gin.Context) {
 }
 
 func (s *Server) ready(c *gin.Context) {
-	if err := s.store.Ping(c.Request.Context()); err != nil {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+	defer cancel()
+	if err := s.store.Ping(ctx); err != nil {
 		s.logger.ErrorContext(c.Request.Context(), "readiness check failed", "error", err)
 		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not_ready"})
 		return
 	}
+	if s.readyCheck != nil {
+		if err := s.readyCheck(ctx); err != nil {
+			s.logger.ErrorContext(c.Request.Context(), "readiness check failed", "dependency", "redis", "error", err)
+			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "not_ready"})
+			return
+		}
+	}
 	c.JSON(http.StatusOK, gin.H{"status": "ready"})
+}
+
+func (s *Server) requireScope(scope string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if s.authMode != "api_key" {
+			c.Next()
+			return
+		}
+		if s.apiKeys == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "API key authentication is unavailable"})
+			c.Abort()
+			return
+		}
+		const prefix = "Bearer "
+		authorization := c.GetHeader("Authorization")
+		if !strings.HasPrefix(authorization, prefix) {
+			c.Header("WWW-Authenticate", "Bearer")
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "a valid bearer API key is required"})
+			c.Abort()
+			return
+		}
+		token := strings.TrimSpace(strings.TrimPrefix(authorization, prefix))
+		if len(token) < 24 || len(token) > 256 || !strings.HasPrefix(token, "rt_live_") {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "a valid bearer API key is required"})
+			c.Abort()
+			return
+		}
+		hash := sha256.Sum256([]byte(token))
+		key, err := s.apiKeys.AuthenticateAPIKey(c.Request.Context(), hash[:])
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "a valid bearer API key is required"})
+			} else {
+				s.logger.ErrorContext(c.Request.Context(), "API key authentication failed", "error", err)
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "API key authentication is temporarily unavailable"})
+			}
+			c.Abort()
+			return
+		}
+		if !slices.Contains(key.Scopes, scope) && !slices.Contains(key.Scopes, "*") {
+			c.JSON(http.StatusForbidden, gin.H{"error": "API key does not have the required scope"})
+			c.Abort()
+			return
+		}
+		c.Set("account_id", key.AccountID.String())
+		c.Set("api_key_id", key.ID)
+		c.Next()
+	}
+}
+
+func (s *Server) accountIDFor(c *gin.Context) string {
+	if value, ok := c.Get("account_id"); ok {
+		if accountID, valid := value.(string); valid {
+			return accountID
+		}
+	}
+	return s.accountID
+}
+
+func (s *Server) setCapacity(c *gin.Context) {
+	if s.auditStore == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "capacity management is unavailable"})
+		return
+	}
+	var request struct {
+		Channel        string `json:"channel"`
+		Sender         string `json:"sender"`
+		InitialLimit   int    `json:"initial_daily_limit"`
+		DailyIncrement int    `json:"daily_increment"`
+		MaximumLimit   int    `json:"maximum_daily_limit"`
+	}
+	if err := decodeJSON(c, &request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "request body must be valid JSON with supported fields only"})
+		return
+	}
+	request.Sender = strings.TrimSpace(request.Sender)
+	if (request.Channel != "email" && request.Channel != "sms") ||
+		request.Sender == "" || len(request.Sender) > 200 ||
+		request.InitialLimit < 1 || request.DailyIncrement < 0 ||
+		request.MaximumLimit < request.InitialLimit || request.MaximumLimit > 100_000_000 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "channel, sender, and valid warm-up limits are required"})
+		return
+	}
+	accountID, err := uuid.Parse(s.accountIDFor(c))
+	if err != nil {
+		s.logger.ErrorContext(c.Request.Context(), "authenticated account ID is invalid", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not set sender capacity"})
+		return
+	}
+	if err := s.auditStore.SetSenderCapacity(c.Request.Context(), accountID, request.Channel,
+		request.Sender, request.InitialLimit, request.DailyIncrement, request.MaximumLimit); err != nil {
+		s.logger.ErrorContext(c.Request.Context(), "could not set sender capacity", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not set sender capacity"})
+		return
+	}
+	if err := s.auditStore.RecordAuditEvent(c.Request.Context(), store.AuditEvent{
+		AccountID: accountID, APIKeyID: apiKeyID(c), Action: "sender_capacity.updated",
+		Resource: "sender_capacity", ResourceID: request.Channel + ":" + request.Sender,
+		RequestID: observability.RequestID(c),
+		Details: map[string]any{
+			"initial_daily_limit": request.InitialLimit,
+			"daily_increment":     request.DailyIncrement,
+			"maximum_daily_limit": request.MaximumLimit,
+		},
+	}); err != nil {
+		s.logger.ErrorContext(c.Request.Context(), "could not audit sender capacity change", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not audit sender capacity change"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"channel": request.Channel, "sender": request.Sender,
+		"initial_daily_limit": request.InitialLimit,
+		"daily_increment":     request.DailyIncrement,
+		"maximum_daily_limit": request.MaximumLimit,
+	})
+}
+
+func (s *Server) operationalSummary(c *gin.Context) {
+	if s.auditStore == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "operational summary is unavailable"})
+		return
+	}
+	accountID, err := uuid.Parse(s.accountIDFor(c))
+	if err != nil {
+		s.logger.ErrorContext(c.Request.Context(), "authenticated account ID is invalid", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not load operational summary"})
+		return
+	}
+	summary, err := s.auditStore.OperationalSummary(c.Request.Context(), accountID)
+	if err != nil {
+		s.logger.ErrorContext(c.Request.Context(), "could not load operational summary", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not load operational summary"})
+		return
+	}
+	if s.inspector == nil || s.queueName == "" {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "queue inspection is unavailable"})
+		return
+	}
+	queueInfo, err := s.inspector.GetQueueInfo(s.queueName)
+	if err != nil {
+		s.logger.ErrorContext(c.Request.Context(), "could not inspect notification queue", "error", err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "could not inspect notification queue"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"database": summary,
+		"queue": gin.H{
+			"name": queueInfo.Queue, "pending": queueInfo.Pending, "active": queueInfo.Active,
+			"scheduled": queueInfo.Scheduled, "retry": queueInfo.Retry, "archived": queueInfo.Archived,
+			"size": queueInfo.Size, "latency_seconds": queueInfo.Latency.Seconds(),
+			"paused": queueInfo.Paused, "failed_today": queueInfo.Failed,
+		},
+	})
+}
+
+func (s *Server) listDeadLetters(c *gin.Context) {
+	if s.inspector == nil || s.queueName == "" {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "queue inspection is unavailable"})
+		return
+	}
+	limit := 50
+	if rawLimit := c.Query("limit"); rawLimit != "" {
+		parsedLimit, err := strconv.Atoi(rawLimit)
+		if err != nil || parsedLimit < 1 || parsedLimit > 100 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "limit must be an integer between 1 and 100"})
+			return
+		}
+		limit = parsedLimit
+	}
+	tasks, err := s.inspector.ListArchivedTasks(s.queueName, asynq.PageSize(limit))
+	if err != nil {
+		s.logger.ErrorContext(c.Request.Context(), "could not list archived tasks", "error", err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "could not list archived tasks"})
+		return
+	}
+	type archivedTask struct {
+		ID           string    `json:"id"`
+		Type         string    `json:"type"`
+		Retried      int       `json:"retried"`
+		MaxRetry     int       `json:"max_retry"`
+		LastFailedAt time.Time `json:"last_failed_at"`
+	}
+	response := make([]archivedTask, 0, len(tasks))
+	for _, task := range tasks {
+		response = append(response, archivedTask{
+			ID: task.ID, Type: task.Type, Retried: task.Retried,
+			MaxRetry: task.MaxRetry, LastFailedAt: task.LastFailedAt,
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"tasks": response})
+}
+
+func (s *Server) retryDeadLetter(c *gin.Context) {
+	if s.inspector == nil || s.queueName == "" {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "queue inspection is unavailable"})
+		return
+	}
+	taskID := strings.TrimSpace(c.Param("id"))
+	if taskID == "" || len(taskID) > 128 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "task ID must be between 1 and 128 characters"})
+		return
+	}
+	if err := s.inspector.RunTask(s.queueName, taskID); err != nil {
+		if errors.Is(err, asynq.ErrTaskNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "archived task not found"})
+			return
+		}
+		s.logger.ErrorContext(c.Request.Context(), "could not retry archived task",
+			"task_id", taskID, "error", err)
+		c.JSON(http.StatusConflict, gin.H{"error": "task could not be retried; it may no longer be archived"})
+		return
+	}
+	accountID, err := uuid.Parse(s.accountIDFor(c))
+	if err != nil {
+		s.logger.ErrorContext(c.Request.Context(), "authenticated account ID is invalid", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "task was retried but the retry could not be audited"})
+		return
+	}
+	if s.auditStore != nil {
+		if err := s.auditStore.RecordAuditEvent(c.Request.Context(), store.AuditEvent{
+			AccountID: accountID, APIKeyID: apiKeyID(c), Action: "queue.archived_task_retried",
+			Resource: "queue_task", ResourceID: taskID, RequestID: observability.RequestID(c),
+			Details: map[string]any{"queue": s.queueName},
+		}); err != nil {
+			s.logger.ErrorContext(c.Request.Context(), "could not audit archived task retry",
+				"task_id", taskID, "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "task was retried but the retry could not be audited"})
+			return
+		}
+	}
+	c.JSON(http.StatusAccepted, gin.H{"task_id": taskID, "status": "queued"})
+}
+
+func (s *Server) deleteMessage(c *gin.Context) {
+	if s.auditStore == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "message deletion is unavailable"})
+		return
+	}
+	messageID, ok := parsePathUUID(c)
+	if !ok {
+		return
+	}
+	accountID, err := uuid.Parse(s.accountIDFor(c))
+	if err != nil {
+		s.logger.ErrorContext(c.Request.Context(), "authenticated account ID is invalid", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not delete message"})
+		return
+	}
+	if err := s.auditStore.DeleteMessage(
+		c.Request.Context(), accountID, messageID, observability.RequestID(c), apiKeyID(c),
+	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "message not found"})
+			return
+		}
+		s.logger.ErrorContext(c.Request.Context(), "could not delete message", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not delete message"})
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+func apiKeyID(c *gin.Context) *uuid.UUID {
+	value, ok := c.Get("api_key_id")
+	if !ok {
+		return nil
+	}
+	keyID, valid := value.(uuid.UUID)
+	if !valid {
+		return nil
+	}
+	return &keyID
+}
+
+func (s *Server) auditMutation(c *gin.Context, action, resource, resourceID string, details any) {
+	if s.auditStore == nil {
+		return
+	}
+	accountID, err := uuid.Parse(s.accountIDFor(c))
+	if err != nil {
+		s.logger.ErrorContext(c.Request.Context(), "could not audit API mutation",
+			"action", action, "error", err)
+		return
+	}
+	if err := s.auditStore.RecordAuditEvent(c.Request.Context(), store.AuditEvent{
+		AccountID: accountID, APIKeyID: apiKeyID(c), Action: action,
+		Resource: resource, ResourceID: resourceID,
+		RequestID: observability.RequestID(c), Details: details,
+	}); err != nil {
+		s.logger.ErrorContext(c.Request.Context(), "could not persist API mutation audit event",
+			"action", action, "resource", resource, "error", err)
+	}
 }
 
 func (s *Server) createNotification(c *gin.Context) {
@@ -232,7 +596,7 @@ func (s *Server) createNotification(c *gin.Context) {
 		return
 	}
 	messageID, duplicate, err := s.store.AcceptNotification(
-		c.Request.Context(), s.accountID, idempotencyKey, notification, payload,
+		c.Request.Context(), s.accountIDFor(c), idempotencyKey, notification, payload,
 	)
 	switch {
 	case errors.Is(err, store.ErrIdempotencyConflict):
@@ -241,6 +605,23 @@ func (s *Server) createNotification(c *gin.Context) {
 		s.logger.ErrorContext(c.Request.Context(), "could not accept notification", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not accept notification"})
 	default:
+		if !duplicate && s.auditStore != nil {
+			accountID, parseErr := uuid.Parse(s.accountIDFor(c))
+			if parseErr != nil {
+				s.logger.ErrorContext(c.Request.Context(), "authenticated account ID is invalid", "error", parseErr)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "could not audit notification acceptance"})
+				return
+			}
+			if auditErr := s.auditStore.RecordAuditEvent(c.Request.Context(), store.AuditEvent{
+				AccountID: accountID, APIKeyID: apiKeyID(c), Action: "notification.accepted",
+				Resource: "message", ResourceID: messageID.String(), RequestID: observability.RequestID(c),
+				Details: map[string]any{"event": notification.Event, "channels": notification.Channels, "region": notification.Region},
+			}); auditErr != nil {
+				s.logger.ErrorContext(c.Request.Context(), "could not audit notification acceptance", "error", auditErr)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "could not audit notification acceptance"})
+				return
+			}
+		}
 		c.JSON(http.StatusAccepted, gin.H{
 			"message_id": messageID.String(),
 			"status":     "accepted",
@@ -283,7 +664,7 @@ func (s *Server) setNotificationPreference(c *gin.Context) {
 		}
 		recipient = phone
 	}
-	accountID, err := uuid.Parse(s.accountID)
+	accountID, err := uuid.Parse(s.accountIDFor(c))
 	if err != nil {
 		s.logger.ErrorContext(c.Request.Context(), "configured account ID is invalid", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not save notification preference"})
@@ -296,6 +677,8 @@ func (s *Server) setNotificationPreference(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not save notification preference"})
 		return
 	}
+	s.auditMutation(c, "notification_preference.updated", "recipient_preference", "",
+		map[string]any{"channel": request.Channel, "enabled": *request.Enabled})
 	c.JSON(http.StatusOK, gin.H{
 		"channel": request.Channel, "recipient": recipient, "enabled": *request.Enabled,
 	})
@@ -349,7 +732,7 @@ func (s *Server) createCustomerWebhook(c *gin.Context) {
 		}
 		seen[event] = struct{}{}
 	}
-	accountID, err := uuid.Parse(s.accountID)
+	accountID, err := uuid.Parse(s.accountIDFor(c))
 	if err != nil {
 		s.logger.ErrorContext(c.Request.Context(), "configured account ID is invalid", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not create customer webhook"})
@@ -375,6 +758,8 @@ func (s *Server) createCustomerWebhook(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not create customer webhook"})
 		return
 	}
+	s.auditMutation(c, "customer_webhook.created", "webhook_endpoint", webhookID.String(),
+		map[string]any{"events": request.Events})
 	c.JSON(http.StatusCreated, gin.H{
 		"id": webhookID.String(), "url": endpointURL, "events": request.Events,
 		"signing_secret": base64.RawURLEncoding.EncodeToString(signingSecret),
@@ -413,7 +798,7 @@ func (s *Server) recordSMSConsent(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "source must be between 1 and 200 characters"})
 		return
 	}
-	accountID, err := uuid.Parse(s.accountID)
+	accountID, err := uuid.Parse(s.accountIDFor(c))
 	if err != nil {
 		s.logger.ErrorContext(c.Request.Context(), "configured account ID is invalid", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not update SMS consent"})
@@ -426,6 +811,9 @@ func (s *Server) recordSMSConsent(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not update SMS consent"})
 		return
 	}
+	s.auditMutation(c, "sms_consent.updated", "sms_consent", "", map[string]any{
+		"scope": request.Scope, "source": strings.TrimSpace(request.Source), "consented": *request.Consented,
+	})
 	status := "withdrawn"
 	if *request.Consented {
 		status = "active"
@@ -471,7 +859,7 @@ func (s *Server) createDomain(c *gin.Context) {
 		spfValue = "v=spf1 include:sendgrid.net ~all"
 	}
 	domainRecord, err := s.domainStore.CreateDomain(
-		c.Request.Context(), s.accountID, domain, material.Selector, material.PublicKey, spfValue, ciphertext,
+		c.Request.Context(), s.accountIDFor(c), domain, material.Selector, material.PublicKey, spfValue, ciphertext,
 	)
 	if err != nil {
 		var pgError *pgconn.PgError
@@ -483,6 +871,8 @@ func (s *Server) createDomain(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not create sending domain"})
 		return
 	}
+	s.auditMutation(c, "sending_domain.created", "domain", domainRecord.ID.String(),
+		map[string]any{"domain": domainRecord.Name})
 	c.JSON(http.StatusCreated, domainResponse(domainRecord))
 }
 
@@ -495,7 +885,7 @@ func (s *Server) domainRecords(c *gin.Context) {
 	if !ok {
 		return
 	}
-	domainRecord, err := s.domainStore.GetDomain(c.Request.Context(), s.accountID, domainID)
+	domainRecord, err := s.domainStore.GetDomain(c.Request.Context(), s.accountIDFor(c), domainID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "domain not found"})
 		return
@@ -517,7 +907,7 @@ func (s *Server) verifyDomain(c *gin.Context) {
 	if !ok {
 		return
 	}
-	if err := s.domainStore.RequestDomainVerification(c.Request.Context(), s.accountID, domainID); err != nil {
+	if err := s.domainStore.RequestDomainVerification(c.Request.Context(), s.accountIDFor(c), domainID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "domain not found"})
 			return
@@ -526,11 +916,12 @@ func (s *Server) verifyDomain(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not request domain verification"})
 		return
 	}
-	if err := s.enqueueDomainVerification(c.Request.Context(), s.accountID, domainID); err != nil {
+	if err := s.enqueueDomainVerification(c.Request.Context(), s.accountIDFor(c), domainID); err != nil {
 		s.logger.ErrorContext(c.Request.Context(), "could not enqueue domain verification", "error", err)
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "domain verification could not be queued; retry the request"})
 		return
 	}
+	s.auditMutation(c, "sending_domain.verification_requested", "domain", domainID.String(), nil)
 	c.JSON(http.StatusAccepted, gin.H{"domain_id": domainID.String(), "verification_status": "pending"})
 }
 
@@ -797,7 +1188,7 @@ func (s *Server) processTelnyxSMSStatus(c *gin.Context, eventID, eventType strin
 }
 
 func (s *Server) processSMSInbound(c *gin.Context, provider, eventID, phone, text string) {
-	accountID, err := uuid.Parse(s.accountID)
+	accountID, err := uuid.Parse(s.accountIDFor(c))
 	if err != nil {
 		s.logger.ErrorContext(c.Request.Context(), "configured account ID is invalid", "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not process inbound SMS"})
@@ -949,6 +1340,10 @@ func validateNotification(notification store.Notification) string {
 		notification.TrafficClass != "transactional" &&
 		notification.TrafficClass != "marketing" {
 		return "traffic_class must be transactional or marketing"
+	}
+	if notification.Region != "" &&
+		(len(notification.Region) > 63 || !regionPattern.MatchString(notification.Region)) {
+		return "region must be a lowercase region identifier of at most 63 characters"
 	}
 	if slices.Contains(notification.Channels, "email") {
 		address, err := mail.ParseAddress(notification.Recipient.Email)

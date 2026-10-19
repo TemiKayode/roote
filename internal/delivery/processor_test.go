@@ -30,7 +30,10 @@ type fakeRepository struct {
 	smsConsent            bool
 	smsSuppressed         bool
 	smsBudgetError        error
+	senderCapacityError   error
 	smsReservedCost       float64
+	smsBudgetReleaseCount int
+	senderCapacityCount   int
 	smsSendCount          int
 	smsComplete           int
 	smsConfirmationBudget float64
@@ -38,6 +41,7 @@ type fakeRepository struct {
 	channelFailures       []string
 	channelSkips          []string
 	failureWebhookCount   int
+	exhaustedRetries      int
 }
 
 func (f *fakeRepository) GetDomain(context.Context, string, uuid.UUID) (store.Domain, error) {
@@ -92,7 +96,17 @@ func (f *fakeRepository) ReserveSMSBudget(_ context.Context, _, _ uuid.UUID, _ s
 	f.smsReservedCost = cost
 	return f.smsBudgetError
 }
-func (f *fakeRepository) ReleaseSMSBudget(context.Context, uuid.UUID) error { return nil }
+func (f *fakeRepository) ReserveSenderCapacity(context.Context, uuid.UUID, string, string, int, int, int) error {
+	f.senderCapacityCount++
+	return f.senderCapacityError
+}
+func (f *fakeRepository) ReleaseSenderCapacity(context.Context, uuid.UUID, string, string) error {
+	return nil
+}
+func (f *fakeRepository) ReleaseSMSBudget(context.Context, uuid.UUID) error {
+	f.smsBudgetReleaseCount++
+	return nil
+}
 func (f *fakeRepository) BeginSMSDelivery(_ context.Context, _ store.SMSJob, _ string, _ string, _ float64) (bool, error) {
 	f.smsSendCount++
 	return true, nil
@@ -111,6 +125,10 @@ func (f *fakeRepository) ReserveSMSConfirmationBudget(
 func (f *fakeRepository) ReleaseSMSConfirmationBudget(context.Context, string) error { return nil }
 func (f *fakeRepository) MarkMessageFailed(_ context.Context, _ uuid.UUID, reason string) error {
 	f.failureReason = reason
+	return nil
+}
+func (f *fakeRepository) FailMessageRetriesExhausted(_ context.Context, _ uuid.UUID, retries, maximum int) error {
+	f.exhaustedRetries = retries + maximum
 	return nil
 }
 func (f *fakeRepository) RecordChannelFailure(
@@ -273,6 +291,60 @@ func TestDeliverSMSFailsClosedWithoutConsent(t *testing.T) {
 	}
 	if repository.smsSendCount != 0 || repository.smsReservedCost != 0 {
 		t.Fatal("SMS was budgeted or sent without consent")
+	}
+}
+
+func TestDeliverSMSStopsWhenSenderWarmupLimitIsReached(t *testing.T) {
+	repository := &fakeRepository{
+		smsJob: store.SMSJob{
+			ID: uuid.New(), AccountID: uuid.New(),
+			Channels: []string{"sms"}, Recipient: "+14155552671", Body: "Hello",
+		},
+		smsConsent:          true,
+		senderCapacityError: store.ErrSenderCapacity,
+	}
+	transport := &fakeSMSTransport{}
+	processor := NewProcessor(repository, nil, transport, config.Config{
+		SMSTransport:             "twilio",
+		SMSRateLimitPerMinute:    10,
+		SMSCountryRatesUSD:       map[string]float64{"US": 0.01},
+		SMSCountryMonthlyCapsUSD: map[string]float64{"US": 20},
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := processor.DeliverSMS(context.Background(), repository.smsJob.ID); !errors.Is(err, store.ErrSenderCapacity) {
+		t.Fatalf("DeliverSMS() error = %v, want ErrSenderCapacity", err)
+	}
+	if repository.smsSendCount != 0 || repository.smsReservedCost != 0 ||
+		repository.senderCapacityCount != 1 || transport.message.To != "" {
+		t.Fatalf("warm-up limit did not stop sending before SMS budget reservation: sends=%d reserved=%.4f capacity=%d message=%+v",
+			repository.smsSendCount, repository.smsReservedCost, repository.senderCapacityCount, transport.message)
+	}
+}
+
+func TestEmailCapacityIdentityUsesTrafficClassIPPool(t *testing.T) {
+	tests := []struct {
+		name         string
+		trafficClass string
+		want         string
+	}{
+		{name: "transactional pool", trafficClass: "transactional", want: "sendgrid:ip-pool:transactional-pool"},
+		{name: "marketing pool", trafficClass: "marketing", want: "sendgrid:ip-pool:marketing-pool"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := emailCapacityIdentity(
+				"sendgrid", test.trafficClass, "Alerts.Example.org",
+				"transactional-pool", "marketing-pool",
+			)
+			if got != test.want {
+				t.Fatalf("emailCapacityIdentity() = %q, want %q", got, test.want)
+			}
+		})
+	}
+	if got := emailCapacityIdentity("kumo-smtp", "transactional", "Alerts.Example.org", "", ""); got != "kumo-smtp:domain:alerts.example.org" {
+		t.Fatalf("SMTP capacity identity = %q", got)
+	}
+	if got := emailCapacityIdentity("sendgrid", "marketing", "Alerts.Example.org", "transactional-pool", ""); got != "sendgrid:domain:alerts.example.org" {
+		t.Fatalf("unpooled SendGrid capacity identity = %q", got)
 	}
 }
 
@@ -493,5 +565,24 @@ func TestSMSStopConfirmationReservesRateAndCountryBudget(t *testing.T) {
 	if repository.smsConfirmationBudget != 0.02 || transport.message.TrackStatus {
 		t.Fatalf("confirmation reservation = %.4f, transport message = %+v",
 			repository.smsConfirmationBudget, transport.message)
+	}
+}
+
+func TestHandleNotificationTaskPersistsRetryExhaustion(t *testing.T) {
+	repository := &fakeRepository{}
+	processor := NewProcessor(repository, nil, nil, config.Config{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	err := processor.HandleNotificationTask(context.Background(), uuid.New(), 24, 25)
+	if err == nil {
+		t.Fatal("HandleNotificationTask() returned no error for an invalid notification")
+	}
+	if repository.exhaustedRetries != 0 {
+		t.Fatalf("retry exhaustion was recorded before the final retry: %d", repository.exhaustedRetries)
+	}
+	err = processor.HandleNotificationTask(context.Background(), uuid.New(), 25, 25)
+	if err == nil {
+		t.Fatal("HandleNotificationTask() returned no error for an invalid notification")
+	}
+	if repository.exhaustedRetries != 50 {
+		t.Fatalf("retry exhaustion record = %d, want 50", repository.exhaustedRetries)
 	}
 }

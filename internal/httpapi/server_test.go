@@ -22,6 +22,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/TemiKayode/roote/internal/observability"
 	securesecret "github.com/TemiKayode/roote/internal/secret"
 	"github.com/TemiKayode/roote/internal/store"
 )
@@ -40,6 +41,14 @@ type fakeMilestoneFourStore struct {
 	webhookURL        string
 	webhookSecret     []byte
 	webhookEvents     []string
+}
+
+type fakeAPIKeyStore struct {
+	key store.APIKey
+}
+
+func (f *fakeAPIKeyStore) AuthenticateAPIKey(context.Context, []byte) (store.APIKey, error) {
+	return f.key, nil
 }
 
 func (f *fakeMilestoneFourStore) SetNotificationPreference(
@@ -172,6 +181,60 @@ func TestCreateNotificationRejectsInvalidRecipient(t *testing.T) {
 	if repository.calls != 0 {
 		t.Fatalf("invalid request reached store %d times", repository.calls)
 	}
+}
+
+func TestAPIKeyAuthenticationScopesAndRequestMetrics(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	accountID := uuid.New()
+	metrics := observability.NewMetrics()
+	authenticator := &fakeAPIKeyStore{key: store.APIKey{
+		ID: uuid.New(), AccountID: accountID, Scopes: []string{"domains:read"},
+	}}
+	router := NewWithRuntime(
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		accountID.String(),
+		&fakeStore{},
+		EmailFeatures{},
+		SMSFeatures{},
+		CustomerWebhookFeatures{},
+		RuntimeFeatures{AuthMode: "api_key", APIKeys: authenticator, Metrics: metrics},
+	)
+	body := `{"event":"welcome","channels":["email"],"recipient":{"email":"person@example.com"},"content":{"subject":"Welcome","body":"Hello"}}`
+	unauthorized := postNotification(router, "auth-1", body)
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("missing API key status = %d, want %d", unauthorized.Code, http.StatusUnauthorized)
+	}
+	if _, err := uuid.Parse(unauthorized.Header().Get(observability.RequestIDHeader)); err != nil {
+		t.Fatalf("request ID response header is invalid: %v", err)
+	}
+
+	token := "rt_live_" + strings.Repeat("a", 43)
+	forbidden := postNotificationWithToken(router, "auth-2", body, token)
+	if forbidden.Code != http.StatusForbidden {
+		t.Fatalf("insufficient-scope status = %d, want %d: %s", forbidden.Code, http.StatusForbidden, forbidden.Body)
+	}
+	authenticator.key.Scopes = []string{"notifications:write"}
+	accepted := postNotificationWithToken(router, "auth-3", body, token)
+	if accepted.Code != http.StatusAccepted {
+		t.Fatalf("scoped request status = %d, want %d: %s", accepted.Code, http.StatusAccepted, accepted.Body)
+	}
+	scrape := httptest.NewRecorder()
+	router.ServeHTTP(scrape, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if scrape.Code != http.StatusOK ||
+		!strings.Contains(scrape.Body.String(), `route="/v1/notifications"`) ||
+		!strings.Contains(scrape.Body.String(), "roote_http_request_duration_seconds_bucket") {
+		t.Fatalf("metrics response missing request counters or histograms: %s", scrape.Body)
+	}
+}
+
+func postNotificationWithToken(router http.Handler, idempotencyKey, body, token string) *httptest.ResponseRecorder {
+	request := httptest.NewRequest(http.MethodPost, "/v1/notifications", bytes.NewBufferString(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Idempotency-Key", idempotencyKey)
+	request.Header.Set("Authorization", "Bearer "+token)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+	return recorder
 }
 
 func TestValidateNotificationRoutingModesAndOrder(t *testing.T) {

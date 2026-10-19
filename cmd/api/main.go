@@ -13,10 +13,12 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/TemiKayode/roote/internal/config"
 	"github.com/TemiKayode/roote/internal/emailwebhook"
 	"github.com/TemiKayode/roote/internal/httpapi"
+	"github.com/TemiKayode/roote/internal/observability"
 	"github.com/TemiKayode/roote/internal/queue"
 	"github.com/TemiKayode/roote/internal/store"
 )
@@ -44,6 +46,11 @@ func run() error {
 	defer database.Close()
 	queueClient := asynq.NewClient(asynq.RedisClientOpt{Addr: cfg.RedisURL})
 	defer queueClient.Close()
+	inspector := asynq.NewInspector(asynq.RedisClientOpt{Addr: cfg.RedisURL})
+	defer inspector.Close()
+	redisClient := redis.NewClient(&redis.Options{Addr: cfg.RedisURL})
+	defer redisClient.Close()
+	metrics := observability.NewMetrics()
 
 	var webhookVerifier httpapi.WebhookVerifier
 	if cfg.SendGridWebhookPublicKey != "" {
@@ -55,7 +62,7 @@ func run() error {
 
 	server := &http.Server{
 		Addr: fmt.Sprintf(":%d", cfg.HTTPPort),
-		Handler: httpapi.NewWithAllFeatures(logger, cfg.AccountID, database, httpapi.EmailFeatures{
+		Handler: httpapi.NewWithRuntime(logger, cfg.AccountID, database, httpapi.EmailFeatures{
 			DomainStore:   database,
 			EncryptionKey: cfg.DKIMEncryptionKey,
 			SPFValue:      cfg.EmailSPFValue,
@@ -76,8 +83,22 @@ func run() error {
 		}, httpapi.CustomerWebhookFeatures{
 			Store:         database,
 			EncryptionKey: cfg.WebhookEncryptionKey,
+		}, httpapi.RuntimeFeatures{
+			AuthMode:   cfg.APIAuthMode,
+			APIKeys:    database,
+			AuditStore: database,
+			Inspector:  inspector,
+			QueueName:  cfg.AsynqQueue,
+			ReadyCheck: func(ctx context.Context) error {
+				return redisClient.Ping(ctx).Err()
+			},
+			Metrics: metrics,
 		}),
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 	serverErrors := make(chan error, 1)
 	go func() {
@@ -91,7 +112,9 @@ func run() error {
 			return fmt.Errorf("serve HTTP: %w", err)
 		}
 	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(
+			context.Background(), time.Duration(cfg.ShutdownTimeoutSeconds)*time.Second,
+		)
 		defer cancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			return fmt.Errorf("shut down HTTP server: %w", err)

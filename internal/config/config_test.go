@@ -5,6 +5,17 @@ import "testing"
 func setBaseEnvironment(t *testing.T) {
 	t.Helper()
 	t.Setenv("APP_PORT", "")
+	t.Setenv("METRICS_PORT", "")
+	t.Setenv("API_AUTH_MODE", "api_key")
+	t.Setenv("MESSAGE_RETENTION_DAYS", "")
+	t.Setenv("SHUTDOWN_TIMEOUT_SECONDS", "")
+	t.Setenv("WORKER_CONCURRENCY", "")
+	t.Setenv("EMAIL_WARMUP_INITIAL_LIMIT", "")
+	t.Setenv("EMAIL_WARMUP_DAILY_INCREMENT", "")
+	t.Setenv("EMAIL_WARMUP_MAXIMUM_LIMIT", "")
+	t.Setenv("SMS_WARMUP_INITIAL_LIMIT", "")
+	t.Setenv("SMS_WARMUP_DAILY_INCREMENT", "")
+	t.Setenv("SMS_WARMUP_MAXIMUM_LIMIT", "")
 	t.Setenv("DATABASE_URL", "postgres://user:pass@localhost/notify")
 	t.Setenv("REDIS_URL", "localhost:6379")
 	t.Setenv("ACCOUNT_ID", "account")
@@ -98,5 +109,22 @@ func TestLoadAcceptsDisabledLocalConfiguration(t *testing.T) {
 	}
 	if cfg.EmailTransport != "disabled" || cfg.HTTPPort != 8080 {
 		t.Fatalf("unexpected local config: %+v", cfg)
+	}
+	if cfg.APIAuthMode != "api_key" || cfg.RetentionDays != 90 || cfg.WorkerConcurrency != 10 {
+		t.Fatalf("unexpected M5 defaults: %+v", cfg)
+	}
+}
+
+func TestLoadRejectsInvalidAPIAuthAndWarmupConfiguration(t *testing.T) {
+	setBaseEnvironment(t)
+	t.Setenv("API_AUTH_MODE", "none")
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() accepted an unsupported API_AUTH_MODE")
+	}
+	setBaseEnvironment(t)
+	t.Setenv("EMAIL_WARMUP_INITIAL_LIMIT", "1000")
+	t.Setenv("EMAIL_WARMUP_MAXIMUM_LIMIT", "999")
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() accepted a warm-up maximum below its initial limit")
 	}
 }

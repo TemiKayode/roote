@@ -34,6 +34,8 @@ type Repository interface {
 	IsSMSSuppressed(context.Context, uuid.UUID, string) (bool, error)
 	HasSMSConsent(context.Context, uuid.UUID, string, string) (bool, error)
 	ReserveSMSBudget(context.Context, uuid.UUID, uuid.UUID, string, float64, float64, int) error
+	ReserveSenderCapacity(context.Context, uuid.UUID, string, string, int, int, int) error
+	ReleaseSenderCapacity(context.Context, uuid.UUID, string, string) error
 	ReleaseSMSBudget(context.Context, uuid.UUID) error
 	BeginSMSDelivery(context.Context, store.SMSJob, string, string, float64) (bool, error)
 	CompleteSMSDelivery(context.Context, uuid.UUID, string) error
@@ -41,6 +43,7 @@ type Repository interface {
 	RecordChannelFailure(context.Context, uuid.UUID, string, string) error
 	RecordChannelSkipped(context.Context, uuid.UUID, string) error
 	EmitNotificationFailure(context.Context, uuid.UUID) error
+	FailMessageRetriesExhausted(context.Context, uuid.UUID, int, int) error
 	ReserveSMSConfirmationBudget(context.Context, string, uuid.UUID, string, float64, float64, int) error
 	ReleaseSMSConfirmationBudget(context.Context, string) error
 	MarkMessageFailed(context.Context, uuid.UUID, string) error
@@ -196,6 +199,21 @@ func (p *Processor) DeliverNotification(ctx context.Context, messageID uuid.UUID
 	return nil
 }
 
+func (p *Processor) HandleNotificationTask(
+	ctx context.Context,
+	messageID uuid.UUID,
+	retries, maximumRetries int,
+) error {
+	err := p.DeliverNotification(ctx, messageID)
+	if err == nil || maximumRetries <= 0 || retries < maximumRetries {
+		return err
+	}
+	if failErr := p.repository.FailMessageRetriesExhausted(ctx, messageID, retries, maximumRetries); failErr != nil {
+		return errors.Join(err, fmt.Errorf("persist exhausted notification retries: %w", failErr))
+	}
+	return err
+}
+
 func (p *Processor) finalizeChannelError(ctx context.Context, messageID uuid.UUID, err error) error {
 	if err == nil || !errors.Is(err, asynq.SkipRetry) {
 		return err
@@ -274,12 +292,23 @@ func (p *Processor) deliverEmail(ctx context.Context, job store.EmailJob) error 
 	if err != nil {
 		return p.failChannelPermanently(ctx, messageID, "email", err.Error())
 	}
+	sender := emailCapacityIdentity(
+		p.transport.Provider(), job.TrafficClass, parts[1],
+		p.config.SendGridTransactionalPool, p.config.SendGridMarketingPool,
+	)
+	if err := p.repository.ReserveSenderCapacity(
+		ctx, job.AccountID, "email", sender,
+		p.config.EmailWarmupInitialLimit, p.config.EmailWarmupDailyIncrement,
+		p.config.EmailWarmupMaximumLimit,
+	); err != nil {
+		return fmt.Errorf("reserve email sender warm-up capacity: %w", err)
+	}
 	shouldSend, err := p.repository.BeginEmailDelivery(ctx, job, p.transport.Provider())
 	if err != nil {
-		return err
+		return errors.Join(err, p.repository.ReleaseSenderCapacity(ctx, job.AccountID, "email", sender))
 	}
 	if !shouldSend {
-		return nil
+		return p.repository.ReleaseSenderCapacity(ctx, job.AccountID, "email", sender)
 	}
 	providerMessageID, err := p.transport.Send(ctx, message)
 	if err != nil {
@@ -304,6 +333,21 @@ func (p *Processor) deliverEmail(ctx context.Context, job store.EmailJob) error 
 		"provider_message_id", providerMessageID,
 	)
 	return nil
+}
+
+func emailCapacityIdentity(
+	provider, trafficClass, domain, transactionalPool, marketingPool string,
+) string {
+	if provider == "sendgrid" {
+		pool := transactionalPool
+		if trafficClass == "marketing" {
+			pool = marketingPool
+		}
+		if pool != "" {
+			return provider + ":ip-pool:" + pool
+		}
+	}
+	return provider + ":domain:" + strings.ToLower(domain)
 }
 
 func (p *Processor) DeliverSMS(ctx context.Context, messageID uuid.UUID) error {
@@ -347,9 +391,20 @@ func (p *Processor) DeliverSMS(ctx context.Context, messageID uuid.UUID) error {
 	}
 	segments := sms.SegmentCount(job.Body)
 	estimatedCost := float64(segments) * rate
+	sender := p.smsTransport.Provider() + ":" + p.config.SMSFrom + ":" + countryCode
+	if err := p.repository.ReserveSenderCapacity(
+		ctx, job.AccountID, "sms", sender,
+		p.config.SMSWarmupInitialLimit, p.config.SMSWarmupDailyIncrement,
+		p.config.SMSWarmupMaximumLimit,
+	); err != nil {
+		return fmt.Errorf("reserve SMS sender warm-up capacity: %w", err)
+	}
 	if err := p.repository.ReserveSMSBudget(
 		ctx, job.ID, job.AccountID, countryCode, estimatedCost, budget, p.config.SMSRateLimitPerMinute,
 	); err != nil {
+		if releaseErr := p.repository.ReleaseSenderCapacity(ctx, job.AccountID, "sms", sender); releaseErr != nil {
+			return errors.Join(fmt.Errorf("reserve SMS sending capacity: %w", err), releaseErr)
+		}
 		if errors.Is(err, store.ErrSMSRateLimit) {
 			return fmt.Errorf("reserve SMS rate limit: %w", err)
 		}
@@ -360,10 +415,11 @@ func (p *Processor) DeliverSMS(ctx context.Context, messageID uuid.UUID) error {
 	}
 	shouldSend, err := p.repository.BeginSMSDelivery(ctx, job, p.smsTransport.Provider(), countryCode, estimatedCost)
 	if err != nil {
-		return fmt.Errorf("begin SMS delivery: %w", err)
+		return errors.Join(fmt.Errorf("begin SMS delivery: %w", err),
+			p.repository.ReleaseSenderCapacity(ctx, job.AccountID, "sms", sender))
 	}
 	if !shouldSend {
-		return nil
+		return p.repository.ReleaseSenderCapacity(ctx, job.AccountID, "sms", sender)
 	}
 	providerMessageID, err := p.smsTransport.Send(ctx, sms.Message{
 		ID: job.ID.String(), To: job.Recipient, Body: job.Body, TrackStatus: true,
@@ -423,9 +479,21 @@ func (p *Processor) SendSMSStopConfirmation(
 		return fmt.Errorf("parse configured account ID for SMS confirmation: %w", err)
 	}
 	amount := float64(sms.SegmentCount(p.config.SMSStopConfirmation)) * rate
+	sender := p.smsTransport.Provider() + ":" + p.config.SMSFrom + ":" + countryCode
+	if err := p.repository.ReserveSenderCapacity(
+		ctx, accountID, "sms",
+		sender,
+		p.config.SMSWarmupInitialLimit, p.config.SMSWarmupDailyIncrement,
+		p.config.SMSWarmupMaximumLimit,
+	); err != nil {
+		return fmt.Errorf("reserve SMS STOP confirmation warm-up capacity: %w", err)
+	}
 	if err := p.repository.ReserveSMSConfirmationBudget(
 		ctx, eventID, accountID, countryCode, amount, budget, p.config.SMSRateLimitPerMinute,
 	); err != nil {
+		if releaseErr := p.repository.ReleaseSenderCapacity(ctx, accountID, "sms", sender); releaseErr != nil {
+			return errors.Join(err, releaseErr)
+		}
 		if errors.Is(err, store.ErrSMSCountryBudget) {
 			return fmt.Errorf("%w: %v", asynq.SkipRetry, err)
 		}

@@ -2,17 +2,22 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/TemiKayode/roote/internal/config"
 	"github.com/TemiKayode/roote/internal/delivery"
+	"github.com/TemiKayode/roote/internal/observability"
 	"github.com/TemiKayode/roote/internal/queue"
 	"github.com/TemiKayode/roote/internal/store"
 	"github.com/TemiKayode/roote/internal/transport/email"
@@ -57,19 +62,40 @@ func run() error {
 	redis := asynq.RedisClientOpt{Addr: cfg.RedisURL}
 	client := asynq.NewClient(redis)
 	defer client.Close()
+	redisClient := redisv9Client(cfg.RedisURL)
+	defer redisClient.Close()
+	metrics := observability.NewMetrics()
 	server := asynq.NewServer(redis, asynq.Config{
-		Queues: map[string]int{cfg.AsynqQueue: 1},
-		Logger: slogAsynqLogger{logger: logger},
+		Queues:          map[string]int{cfg.AsynqQueue: 1},
+		Concurrency:     cfg.WorkerConcurrency,
+		ShutdownTimeout: time.Duration(cfg.ShutdownTimeoutSeconds) * time.Second,
+		Logger:          slogAsynqLogger{logger: logger},
 	})
 	if err := server.Start(queue.NewServeMux(
 		logger,
-		processor.DeliverNotification,
-		processor.VerifyDomain,
-		processor.SendSMSStopConfirmation,
+		func(ctx context.Context, messageID uuid.UUID) error {
+			return observeTask(metrics, queue.TaskNotificationDelivery, func() error {
+				retries, _ := asynq.GetRetryCount(ctx)
+				maximumRetries, _ := asynq.GetMaxRetry(ctx)
+				return processor.HandleNotificationTask(ctx, messageID, retries, maximumRetries)
+			})
+		},
+		func(ctx context.Context, accountID string, domainID uuid.UUID) error {
+			return observeTask(metrics, queue.TaskDomainVerification, func() error {
+				return processor.VerifyDomain(ctx, accountID, domainID)
+			})
+		},
+		func(ctx context.Context, provider, phone, eventID string) error {
+			return observeTask(metrics, queue.TaskSMSStopConfirmation, func() error {
+				return processor.SendSMSStopConfirmation(ctx, provider, phone, eventID)
+			})
+		},
 		func(ctx context.Context, deliveryID uuid.UUID) error {
 			retries, _ := asynq.GetRetryCount(ctx)
 			maxRetries, _ := asynq.GetMaxRetry(ctx)
-			return webhookHandler.Handle(ctx, deliveryID, retries, maxRetries)
+			return observeTask(metrics, queue.TaskWebhookDelivery, func() error {
+				return webhookHandler.Handle(ctx, deliveryID, retries, maxRetries)
+			})
 		},
 	)); err != nil {
 		return fmt.Errorf("start Asynq server: %w", err)
@@ -80,12 +106,122 @@ func run() error {
 	go database.RunWebhookRelay(ctx, func(ctx context.Context, deliveryID uuid.UUID) error {
 		return queue.EnqueueWebhookDelivery(ctx, client, cfg.AsynqQueue, deliveryID)
 	}, logger)
+	accountID, err := uuid.Parse(cfg.AccountID)
+	if err != nil {
+		return fmt.Errorf("parse configured account ID: %w", err)
+	}
+	go runRetention(ctx, database, accountID, cfg.RetentionDays, logger)
+	metricsMux := http.NewServeMux()
+	metricsMux.HandleFunc("/metrics", metrics.Handler)
+	metricsMux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok\n"))
+	})
+	metricsMux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		readyCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		if err := database.Ping(readyCtx); err != nil {
+			http.Error(w, "not ready", http.StatusServiceUnavailable)
+			return
+		}
+		if err := redisClient.Ping(readyCtx).Err(); err != nil {
+			http.Error(w, "not ready", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ready\n"))
+	})
+	metricsServer := &http.Server{
+		Addr: fmt.Sprintf(":%d", cfg.MetricsPort), Handler: metricsMux,
+		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second,
+		IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20,
+	}
+	metricsErrors := make(chan error, 1)
+	go func() {
+		metricsErrors <- metricsServer.ListenAndServe()
+	}()
 
 	logger.Info("worker started", "queue", cfg.AsynqQueue)
-	<-ctx.Done()
-	server.Shutdown()
+	var metricsServerErr error
+	select {
+	case <-ctx.Done():
+	case serveErr := <-metricsErrors:
+		if !errors.Is(serveErr, http.ErrServerClosed) {
+			metricsServerErr = fmt.Errorf("serve worker metrics: %w", serveErr)
+			logger.Error("worker metrics server stopped", "error", serveErr)
+			stop()
+		}
+	}
+	shutdownCtx, cancelShutdown := context.WithTimeout(
+		context.Background(), time.Duration(cfg.ShutdownTimeoutSeconds)*time.Second,
+	)
+	defer cancelShutdown()
+	if err := metricsServer.Shutdown(shutdownCtx); err != nil {
+		logger.Error("could not shut down worker metrics server cleanly", "error", err)
+	}
+	shutdownComplete := make(chan struct{})
+	go func() {
+		server.Shutdown()
+		close(shutdownComplete)
+	}()
+	select {
+	case <-shutdownComplete:
+	case <-shutdownCtx.Done():
+		return errors.Join(metricsServerErr, fmt.Errorf("worker shutdown timed out: %w", shutdownCtx.Err()))
+	}
 	logger.Info("worker stopped")
-	return nil
+	return metricsServerErr
+}
+
+func redisv9Client(address string) *redis.Client {
+	return redis.NewClient(&redis.Options{Addr: address})
+}
+
+func observeTask(metrics *observability.Metrics, name string, handler func() error) error {
+	err := handler()
+	result := "success"
+	if err != nil {
+		result = "failure"
+	}
+	metrics.ObserveTask(name, result)
+	return err
+}
+
+func runRetention(
+	ctx context.Context,
+	database *store.Store,
+	accountID uuid.UUID,
+	retentionDays int,
+	logger *slog.Logger,
+) {
+	run := func() {
+		for {
+			deleted, err := database.PurgeExpiredMessages(ctx, accountID, retentionDays)
+			if err != nil {
+				if ctx.Err() == nil {
+					logger.ErrorContext(ctx, "message retention purge failed", "error", err)
+				}
+				return
+			}
+			if deleted > 0 {
+				logger.InfoContext(ctx, "expired messages purged", "count", deleted)
+			}
+			if deleted < 1000 {
+				return
+			}
+		}
+	}
+	run()
+	ticker := time.NewTicker(24 * time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			run()
+		}
+	}
 }
 
 func newSMSTransport(cfg config.Config) (sms.Transport, error) {
